@@ -126,15 +126,14 @@ async fn main() -> ExitCode {
 
 async fn run(args: RunArgs) -> Result<u8> {
     let mut rcfile = NamedTempFile::new().context("failed to create temporary bash rcfile")?;
-    let hook_path = rcfile.path().to_string_lossy().into_owned();
-    rcfile
-        .write_all(witness_hook_rc(&hook_path).as_bytes())
-        .context("failed to write temporary bash rcfile")?;
-    rcfile.flush().context("failed to flush bash rcfile")?;
     rcfile
         .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o644))
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
         .context("failed to set bash rcfile permissions")?;
+    rcfile
+        .write_all(witness_hook_rc().as_bytes())
+        .context("failed to write temporary bash rcfile")?;
+    rcfile.flush().context("failed to flush bash rcfile")?;
     let child_argv = vec![
         args.shell.clone().into_os_string(),
         OsString::from("--rcfile"),
@@ -247,8 +246,8 @@ fn session_child_env() -> Vec<(String, String)> {
     vec![("WITNESS_SESSION".to_owned(), "1".to_owned())]
 }
 
-fn witness_hook_rc(hook_path: &str) -> String {
-    r#"export WITNESS_HOOK='__WITNESS_HOOK_PATH__'
+fn witness_hook_rc() -> String {
+    r#"export WITNESS_HOOK="${BASH_SOURCE[0]}"
 export WITNESS_SESSION=1
 # witness integration
 if [ -f /etc/bash.bashrc ]; then source /etc/bash.bashrc; fi
@@ -340,7 +339,7 @@ su() {
   command su "$@"
 }
 "#
-    .replace("__WITNESS_HOOK_PATH__", hook_path)
+    .to_owned()
 }
 
 fn base64_encode(input: &[u8]) -> String {
@@ -367,17 +366,13 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 fn remote_bootstrap() -> String {
-    let mut random = [0_u8; 8];
-    rand::rng().fill_bytes(&mut random);
-    let mut hex = String::with_capacity(16);
-    for byte in random {
-        use std::fmt::Write as _;
-        write!(hex, "{byte:02x}").unwrap();
-    }
-    let hook_path = format!("/tmp/.witness-hook.{hex}.sh");
-    let encoded = base64_encode(witness_hook_rc(&hook_path).as_bytes());
+    let encoded = base64_encode(witness_hook_rc().as_bytes());
+    // Create the remote hook with mktemp (secure O_EXCL creation, unpredictable
+    // name, 0600) rather than a predictable /tmp path, avoiding symlink/TOCTOU
+    // attacks in the world-writable temp directory. The hook self-locates its own
+    // path via ${BASH_SOURCE[0]}, so nothing needs to be embedded here.
     format!(
-        "__W='{hook_path}'; printf %s '{encoded}' | base64 -d > \"$__W\" && chmod 644 \"$__W\" && bash --rcfile \"$__W\" -i; rm -f \"$__W\""
+        "__W=\"$(mktemp)\" && chmod 600 \"$__W\" && printf %s '{encoded}' | base64 -d > \"$__W\" && bash --rcfile \"$__W\" -i; rm -f \"$__W\""
     )
 }
 
@@ -564,7 +559,7 @@ fn reverse_dns_blocking(ip: Ipv4Addr) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, looks_like_fqdn, witness_hook_rc};
+    use super::{base64_encode, looks_like_fqdn, remote_bootstrap, witness_hook_rc};
 
     #[test]
     fn fqdn_requires_a_dot() {
@@ -590,7 +585,7 @@ mod tests {
 
     #[test]
     fn hook_contains_command_lifecycle_functions() {
-        let hook = witness_hook_rc("/tmp/x.sh");
+        let hook = witness_hook_rc();
         for expected in [
             "__witness_arm",
             "__witness_precmd",
@@ -603,14 +598,28 @@ mod tests {
 
     #[test]
     fn hook_contains_privilege_change_wrappers() {
-        let hook = witness_hook_rc("/tmp/x.sh");
+        let hook = witness_hook_rc();
         for expected in [
-            "export WITNESS_HOOK='/tmp/x.sh'",
+            "export WITNESS_HOOK=\"${BASH_SOURCE[0]}\"",
             "sudo()",
             "su()",
             "--rcfile \"$WITNESS_HOOK\"",
         ] {
             assert!(hook.contains(expected), "hook is missing {expected}");
         }
+    }
+
+    #[test]
+    fn remote_bootstrap_uses_mktemp_not_predictable_path() {
+        let bootstrap = remote_bootstrap();
+        assert!(bootstrap.contains("mktemp"), "bootstrap should use mktemp");
+        assert!(
+            !bootstrap.contains("/tmp/.witness-hook"),
+            "bootstrap must not write to a predictable path"
+        );
+        assert!(
+            bootstrap.contains("chmod 600"),
+            "bootstrap should chmod 600"
+        );
     }
 }
