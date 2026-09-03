@@ -239,15 +239,39 @@ fn bad_request(error: &'static str) -> (StatusCode, Json<ErrorBody>) {
 }
 
 fn render_suggestion_notice(suggestion: &Suggestion) -> String {
-    let reason = suggestion
-        .reason
-        .as_deref()
-        .map(|reason| format!("  — {reason}"))
-        .unwrap_or_default();
-    format!(
-        "\r\n\x1b[1;36m(witness) suggestion #{} — press Ctrl-G to insert:\x1b[0m {}\x1b[2m{}\x1b[0m\r\n",
-        suggestion.id, suggestion.command, reason
-    )
+    let mut notice = format!(
+        "\r\n\x1b[1;36m(witness) suggestion #{} — press Ctrl-G to insert\x1b[0m\r\n",
+        suggestion.id
+    );
+    if let Some(reason) = suggestion.reason.as_deref() {
+        let _ = write!(notice, "\x1b[2m# {reason}\x1b[0m\r\n");
+    }
+    for line in split_command_lines(&suggestion.command) {
+        let _ = write!(notice, "{line}\r\n");
+    }
+    notice.push_str("\r\n");
+    notice
+}
+
+/// Display-only split of a suggestion onto one line per `;`-separated part
+/// (the semicolon stays on its line). Ctrl-G still inserts the original
+/// single-line text unchanged.
+fn split_command_lines(command: &str) -> Vec<String> {
+    let mut lines: Vec<String> = command
+        .split(';')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(|part| format!("{part};"))
+        .collect();
+    if let Some(last) = lines.last_mut()
+        && !command.trim_end().ends_with(';')
+    {
+        last.pop();
+    }
+    if lines.is_empty() {
+        lines.push(command.trim().to_owned());
+    }
+    lines
 }
 
 async fn not_found() -> (StatusCode, Json<ErrorBody>) {
@@ -528,7 +552,33 @@ pub fn strip_ansi(input: &str) -> String {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 
-    use super::{authorized, generate_docs, strip_ansi};
+    use super::{authorized, generate_docs, split_command_lines, strip_ansi};
+
+    #[test]
+    fn splits_semicolon_commands_for_display() {
+        assert_eq!(split_command_lines("foo; bar"), vec!["foo;", "bar"]);
+        assert_eq!(split_command_lines("single"), vec!["single"]);
+        assert_eq!(split_command_lines("a; b; c"), vec!["a;", "b;", "c"]);
+        assert_eq!(split_command_lines("trailing;"), vec!["trailing;"]);
+    }
+
+    #[test]
+    fn notice_puts_reason_first_then_commands_then_blank_line() {
+        let suggestion = crate::store::Suggestion {
+            id: 7,
+            command: "foo; bar".to_owned(),
+            reason: Some("why".to_owned()),
+            created_at: String::new(),
+            status: crate::store::SuggestionStatus::Pending,
+            inserted_at: None,
+        };
+        let notice = super::render_suggestion_notice(&suggestion);
+        let reason_at = notice.find("# why").expect("reason line");
+        let foo_at = notice.find("foo;\r\n").expect("first command line");
+        let bar_at = notice.find("bar\r\n").expect("second command line");
+        assert!(reason_at < foo_at && foo_at < bar_at);
+        assert!(notice.ends_with("\r\n\r\n"), "blank line after");
+    }
 
     #[test]
     fn strips_color_and_control_sequences() {
