@@ -1,0 +1,62 @@
+name: Build and publish release
+
+on:
+  push:
+    branches: ['master']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/witness dist/witness-linux-glibc
+          (cd dist && sha256sum witness-linux-glibc > sha256sums.txt)
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest --yes 2>/dev/null || true
+          {
+            echo "Local shell recorder with a read-only REST API."
+            echo ""
+            echo "## Installation"
+            echo ""
+            echo '```bash'
+            echo 'curl -fsSL https://github.com/nsg/witness/releases/latest/download/witness-linux-glibc -o ~/bin/witness'
+            echo 'chmod +x ~/bin/witness'
+            echo '```'
+            echo ""
+            echo "## Recent Changes"
+            echo ""
+            echo '```'
+            git log --oneline -20
+            echo '```'
+          } | gh release create latest --title "Latest" --notes-file - \
+            dist/witness-linux-glibc dist/sha256sums.txt
