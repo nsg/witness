@@ -6,7 +6,7 @@ mod store;
 use std::{
     ffi::OsString,
     io::{self, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
     os::fd::AsRawFd,
     os::unix::process::CommandExt,
     path::PathBuf,
@@ -405,12 +405,22 @@ fn generate_token() -> String {
 
 fn resolve_public_host() -> String {
     // Prefer a real FQDN (one with a dot); a bare short name like "foo" is not
-    // resolvable from another machine, so fall back to the primary LAN IP instead.
+    // resolvable from another machine.
+    if let Some(h) = hostname(&["-f"]).filter(|h| looks_like_fqdn(h)) {
+        return h;
+    }
+    if let Some(h) = hostname(&[]).filter(|h| looks_like_fqdn(h)) {
+        return h;
+    }
+    // Otherwise try to learn the FQDN from local DNS via a reverse lookup of the
+    // primary IP; if that has no PTR record, advertise the reachable IP itself.
+    if let Some(ip) = primary_ipv4() {
+        if let Some(h) = reverse_dns(ip).filter(|h| looks_like_fqdn(h)) {
+            return h;
+        }
+        return ip.to_string();
+    }
     hostname(&["-f"])
-        .filter(|h| looks_like_fqdn(h))
-        .or_else(|| hostname(&[]).filter(|h| looks_like_fqdn(h)))
-        .or_else(primary_ipv4)
-        .or_else(|| hostname(&["-f"]))
         .or_else(|| hostname(&[]))
         .unwrap_or_else(|| "127.0.0.1".to_owned())
 }
@@ -433,13 +443,48 @@ fn hostname(args: &[&str]) -> Option<String> {
     }
 }
 
-fn primary_ipv4() -> Option<String> {
+fn primary_ipv4() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
     match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
+        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
         _ => None,
     }
+}
+
+/// Reverse-resolve an IPv4 address to a hostname via local DNS, bounded by a
+/// short timeout so a slow or unreachable resolver cannot stall startup.
+fn reverse_dns(ip: Ipv4Addr) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(reverse_dns_blocking(ip));
+    });
+    rx.recv_timeout(Duration::from_millis(1500)).ok().flatten()
+}
+
+fn reverse_dns_blocking(ip: Ipv4Addr) -> Option<String> {
+    let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    addr.sin_family = libc::AF_INET as libc::sa_family_t;
+    addr.sin_addr = libc::in_addr {
+        s_addr: u32::from_ne_bytes(ip.octets()),
+    };
+    let mut host = [0 as libc::c_char; 256];
+    let ret = unsafe {
+        libc::getnameinfo(
+            &addr as *const libc::sockaddr_in as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            host.as_mut_ptr(),
+            host.len() as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            libc::NI_NAMEREQD,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) };
+    name.to_str().ok().map(str::to_owned)
 }
 
 #[cfg(test)]
