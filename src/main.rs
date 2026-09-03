@@ -404,10 +404,19 @@ fn generate_token() -> String {
 }
 
 fn resolve_public_host() -> String {
+    // Prefer a real FQDN (one with a dot); a bare short name like "foo" is not
+    // resolvable from another machine, so fall back to the primary LAN IP instead.
     hostname(&["-f"])
-        .or_else(|| hostname(&[]))
+        .filter(|h| looks_like_fqdn(h))
+        .or_else(|| hostname(&[]).filter(|h| looks_like_fqdn(h)))
         .or_else(primary_ipv4)
+        .or_else(|| hostname(&["-f"]))
+        .or_else(|| hostname(&[]))
         .unwrap_or_else(|| "127.0.0.1".to_owned())
+}
+
+fn looks_like_fqdn(host: &str) -> bool {
+    host.contains('.') && !host.ends_with('.')
 }
 
 fn hostname(args: &[&str]) -> Option<String> {
@@ -435,7 +444,14 @@ fn primary_ipv4() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, witness_hook_rc};
+    use super::{base64_encode, looks_like_fqdn, witness_hook_rc};
+
+    #[test]
+    fn fqdn_requires_a_dot() {
+        assert!(looks_like_fqdn("foo.example.com"));
+        assert!(!looks_like_fqdn("foo"));
+        assert!(!looks_like_fqdn("host."));
+    }
 
     #[test]
     fn base64_encodes_empty_input() {
