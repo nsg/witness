@@ -1,0 +1,467 @@
+mod api;
+mod parser;
+mod pty;
+mod store;
+
+use std::{
+    ffi::OsString,
+    io::{self, Read, Write},
+    net::{IpAddr, SocketAddr, TcpListener, UdpSocket},
+    os::fd::AsRawFd,
+    os::unix::process::CommandExt,
+    path::PathBuf,
+    process::{Command as ProcessCommand, ExitCode},
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+use clap::{Args, Parser, Subcommand};
+use parser::{MarkerParser, StreamAction};
+use rand::RngCore;
+use store::Store;
+use tempfile::NamedTempFile;
+use tokio::sync::oneshot;
+
+#[derive(Parser)]
+#[command(name = "witness", version, about = "Record an interactive shell")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Wrap an interactive shell and serve the read-only API
+    Run(RunArgs),
+    /// Open an SSH session with witness hooks installed on the remote shell
+    Ssh {
+        /// Arguments passed through to ssh (host and any ssh options)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+    /// Print a fresh random bearer token and exit
+    Token,
+}
+
+#[derive(Args)]
+struct RunArgs {
+    /// Shell to wrap
+    #[arg(long, default_value = "/bin/bash")]
+    shell: PathBuf,
+    /// Address to bind the API to (host:port; port 0 picks a free port)
+    #[arg(long, default_value = "0.0.0.0:0")]
+    addr: SocketAddr,
+    /// Hostname to advertise in the banner and docs (defaults to the machine's FQDN/IP)
+    #[arg(long)]
+    public_host: Option<String>,
+    /// Bearer token (defaults to $WITNESS_TOKEN, else a random one is generated)
+    #[arg(long)]
+    token: Option<String>,
+    /// Maximum number of command records retained
+    #[arg(long, default_value_t = 10_000)]
+    max_commands: usize,
+    /// Maximum captured output bytes per command
+    #[arg(long, default_value_t = 1_048_576)]
+    max_output_bytes: usize,
+}
+
+struct Config {
+    addr: SocketAddr,
+    public_host: Option<String>,
+    token: Option<String>,
+    max_commands: usize,
+    max_output_bytes: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            public_host: None,
+            token: None,
+            max_commands: 10_000,
+            max_output_bytes: 1_048_576,
+        }
+    }
+}
+
+impl From<&RunArgs> for Config {
+    fn from(args: &RunArgs) -> Self {
+        Self {
+            addr: args.addr,
+            public_host: args.public_host.clone(),
+            token: args.token.clone(),
+            max_commands: args.max_commands,
+            max_output_bytes: args.max_output_bytes,
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    match Cli::parse().command {
+        Command::Token => {
+            println!("{}", generate_token());
+            ExitCode::SUCCESS
+        }
+        Command::Run(args) => match run(args).await {
+            Ok(code) => ExitCode::from(code),
+            Err(error) => {
+                eprintln!("witness: {error:#}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Ssh { args } => match ssh(args).await {
+            Ok(code) => ExitCode::from(code),
+            Err(error) => {
+                eprintln!("witness: {error:#}");
+                ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+async fn run(args: RunArgs) -> Result<u8> {
+    let mut rcfile = NamedTempFile::new().context("failed to create temporary bash rcfile")?;
+    rcfile
+        .write_all(witness_hook_rc().as_bytes())
+        .context("failed to write temporary bash rcfile")?;
+    rcfile.flush().context("failed to flush bash rcfile")?;
+    let child_argv = vec![
+        args.shell.clone().into_os_string(),
+        OsString::from("--rcfile"),
+        rcfile.path().as_os_str().to_owned(),
+        OsString::from("-i"),
+    ];
+    run_session(&child_argv, &session_child_env(), &Config::from(&args)).await
+}
+
+async fn ssh(args: Vec<String>) -> Result<u8> {
+    let child_argv = ssh_argv(args);
+    if std::env::var_os("WITNESS_SESSION").is_some() {
+        let error = ProcessCommand::new(&child_argv[0])
+            .args(&child_argv[1..])
+            .exec();
+        return Err(error).context("failed to exec ssh");
+    }
+    run_session(&child_argv, &session_child_env(), &Config::default()).await
+}
+
+async fn run_session(
+    child_argv: &[OsString],
+    child_env: &[(String, String)],
+    cfg: &Config,
+) -> Result<u8> {
+    let token = cfg
+        .token
+        .clone()
+        .or_else(|| std::env::var("WITNESS_TOKEN").ok())
+        .unwrap_or_else(generate_token);
+    let public_host = cfg.public_host.clone().unwrap_or_else(resolve_public_host);
+    let store = Arc::new(Mutex::new(Store::new(
+        cfg.max_commands,
+        cfg.max_output_bytes,
+    )));
+    let listener = TcpListener::bind(cfg.addr)
+        .with_context(|| format!("failed to bind HTTP API to {}", cfg.addr))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read bound HTTP API address")?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to make HTTP API listener nonblocking")?;
+    let listener = tokio::net::TcpListener::from_std(listener)
+        .context("failed to initialize async HTTP API listener")?;
+    let port = local_addr.port();
+    let base_url = format!("http://{public_host}:{port}");
+
+    eprintln!("witness: session ready — read-only shell view for an external agent");
+    eprintln!("witness: api    {base_url}");
+    eprintln!("witness: token  {token}");
+    eprintln!("witness:");
+    eprintln!("witness: give your agent this URL and say \"read this\":");
+    eprintln!("witness:   {base_url}/docs.md?token={token}");
+
+    let size = pty::terminal_size(io::stdin().as_raw_fd());
+    let raw_guard = pty::RawTerminalGuard::new(io::stdin().as_raw_fd())?;
+    let child = pty::spawn_command(child_argv, child_env, size)?;
+    let reader = child
+        .master
+        .try_clone()
+        .context("failed to clone PTY reader")?;
+    let resize_master = child
+        .master
+        .try_clone()
+        .context("failed to clone PTY resize handle")?;
+    let writer = child.master;
+
+    let reader_store = Arc::clone(&store);
+    let (reader_tx, reader_rx) = oneshot::channel();
+    let _reader_thread = thread::spawn(move || {
+        let _ = reader_tx.send(read_pty(reader, reader_store));
+    });
+    let _input_thread = thread::spawn(move || copy_stdin(writer));
+
+    let resize_task = spawn_resize_task(resize_master);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let app = api::router(store, token, public_host, port);
+    let mut server_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let status = tokio::task::spawn_blocking(move || pty::wait_for_child(child.child))
+        .await
+        .context("child wait task panicked")??;
+
+    let _ = shutdown_tx.send(());
+    resize_task.abort();
+    match tokio::time::timeout(Duration::from_secs(2), reader_rx).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(_)) => anyhow::bail!("PTY reader thread stopped unexpectedly"),
+        Err(_) => {}
+    }
+    match tokio::time::timeout(Duration::from_secs(2), &mut server_task).await {
+        Ok(result) => result
+            .context("HTTP server task panicked")?
+            .context("HTTP server failed")?,
+        Err(_) => server_task.abort(),
+    }
+    drop(raw_guard);
+
+    Ok(status)
+}
+
+fn session_child_env() -> Vec<(String, String)> {
+    vec![("WITNESS_SESSION".to_owned(), "1".to_owned())]
+}
+
+fn witness_hook_rc() -> String {
+    r#"# witness integration
+if [ -f /etc/bash.bashrc ]; then source /etc/bash.bashrc; fi
+if [ -f "$HOME/.bashrc" ]; then source "$HOME/.bashrc"; fi
+__witness_armed=0
+__witness_open=0
+__witness_precmd() {
+  __witness_ret=$?
+  if [ "$__witness_open" = 1 ]; then
+    printf '\033]1337;witness;E;%d\007' "$__witness_ret"
+    __witness_open=0
+  fi
+  return 0
+}
+__witness_arm() {
+  __witness_armed=1
+  case "$PS1" in
+    *"(witness)"*) : ;;
+    *) PS1="\[\033[1;38;5;208m\](witness)\[\033[0m\] $PS1" ;;
+  esac
+  return 0
+}
+__witness_preexec() {
+  [ -n "$COMP_LINE" ] && return
+  [ "$__witness_armed" = 1 ] || return
+  __witness_armed=0
+  __witness_open=1
+  printf '\033]1337;witness;B;%s\007' "$BASH_COMMAND"
+}
+trap '__witness_preexec' DEBUG
+PROMPT_COMMAND="__witness_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};__witness_arm"
+"#
+    .to_owned()
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let bits = u32::from(chunk[0]) << 16
+            | u32::from(*chunk.get(1).unwrap_or(&0)) << 8
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        output.push(ALPHABET[((bits >> 18) & 0x3f) as usize] as char);
+        output.push(ALPHABET[((bits >> 12) & 0x3f) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[((bits >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(bits & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+fn remote_bootstrap() -> String {
+    let encoded = base64_encode(witness_hook_rc().as_bytes());
+    format!(
+        "__W=$(mktemp 2>/dev/null || echo \"/tmp/.witness.$$\") && printf %s '{encoded}' | base64 -d > \"$__W\" && bash --rcfile \"$__W\" -i; rm -f \"$__W\""
+    )
+}
+
+fn ssh_argv(args: Vec<String>) -> Vec<OsString> {
+    let mut argv = Vec::with_capacity(args.len() + 3);
+    argv.push(OsString::from("ssh"));
+    argv.push(OsString::from("-t"));
+    argv.extend(args.into_iter().map(OsString::from));
+    argv.push(OsString::from(remote_bootstrap()));
+    argv
+}
+
+fn read_pty(mut reader: std::fs::File, store: Arc<Mutex<Store>>) -> Result<()> {
+    let mut parser = MarkerParser::new();
+    let mut buffer = [0_u8; 8192];
+    let mut stdout = io::stdout().lock();
+
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                let parsed = parser.feed(&buffer[..count]);
+                stdout
+                    .write_all(&parsed.cleaned)
+                    .context("failed to write shell output")?;
+                stdout.flush().context("failed to flush shell output")?;
+                apply_actions(&store, parsed.actions);
+            }
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("failed to read PTY"),
+        }
+    }
+
+    let parsed = parser.finish();
+    stdout
+        .write_all(&parsed.cleaned)
+        .context("failed to write final shell output")?;
+    stdout
+        .flush()
+        .context("failed to flush final shell output")?;
+    apply_actions(&store, parsed.actions);
+    store.lock().unwrap().finish_open(None);
+    Ok(())
+}
+
+fn apply_actions(store: &Arc<Mutex<Store>>, actions: Vec<StreamAction>) {
+    for action in actions {
+        let mut store = store.lock().unwrap();
+        match action {
+            StreamAction::Output(bytes, true) => store.append_output(&bytes),
+            StreamAction::Output(_, false) => {}
+            StreamAction::Event(parser::ParseEvent::Begin(command)) => store.begin(command),
+            StreamAction::Event(parser::ParseEvent::End(code)) => store.end(code),
+        }
+    }
+}
+
+fn copy_stdin(mut writer: std::fs::File) {
+    let mut stdin = io::stdin().lock();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match stdin.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                if writer.write_all(&buffer[..count]).is_err() || writer.flush().is_err() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn spawn_resize_task(master: std::fs::File) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        else {
+            return;
+        };
+        while signal.recv().await.is_some() {
+            let size = pty::terminal_size(io::stdin().as_raw_fd());
+            pty::resize(master.as_raw_fd(), size);
+        }
+    })
+}
+
+fn generate_token() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut token = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(token, "{byte:02x}").unwrap();
+    }
+    token
+}
+
+fn resolve_public_host() -> String {
+    hostname(&["-f"])
+        .or_else(|| hostname(&[]))
+        .or_else(primary_ipv4)
+        .unwrap_or_else(|| "127.0.0.1".to_owned())
+}
+
+fn hostname(args: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new("hostname").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let hostname = String::from_utf8(output.stdout).ok()?;
+    let hostname = hostname.trim();
+    if hostname.is_empty() || matches!(hostname, "localhost" | "localhost.localdomain") {
+        None
+    } else {
+        Some(hostname.to_owned())
+    }
+}
+
+fn primary_ipv4() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{base64_encode, witness_hook_rc};
+
+    #[test]
+    fn base64_encodes_empty_input() {
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn base64_encodes_witness() {
+        assert_eq!(base64_encode(b"witness"), "d2l0bmVzcw==");
+    }
+
+    #[test]
+    fn base64_encodes_two_byte_tail() {
+        assert_eq!(base64_encode(b"hi"), "aGk=");
+    }
+
+    #[test]
+    fn hook_contains_command_lifecycle_functions() {
+        let hook = witness_hook_rc();
+        for expected in [
+            "__witness_arm",
+            "__witness_precmd",
+            "trap '__witness_preexec' DEBUG",
+            "PROMPT_COMMAND=",
+        ] {
+            assert!(hook.contains(expected), "hook is missing {expected}");
+        }
+    }
+}
