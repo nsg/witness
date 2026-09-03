@@ -1,7 +1,16 @@
 use std::collections::VecDeque;
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Status {
+    pub last_id: Option<u64>,
+    pub last_command_at: Option<String>,
+    pub age_seconds: Option<f64>,
+    pub running: bool,
+    pub count: u64,
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CommandRecord {
@@ -125,6 +134,29 @@ impl Store {
         self.records.iter().skip(skip).cloned().collect()
     }
 
+    /// Lightweight snapshot for cheap polling: the newest command's id and
+    /// timestamp, how long ago it happened, and whether one is running.
+    pub fn status(&self) -> Status {
+        let (last_id, at, running) = if let Some(open) = &self.open {
+            (Some(open.id), Some(open.started_at.clone()), true)
+        } else if let Some(last) = self.records.back() {
+            let at = last
+                .finished_at
+                .clone()
+                .unwrap_or_else(|| last.started_at.clone());
+            (Some(last.id), Some(at), false)
+        } else {
+            (None, None, false)
+        };
+        Status {
+            last_id,
+            age_seconds: at.as_deref().and_then(age_seconds),
+            last_command_at: at,
+            running,
+            count: self.next_id.saturating_sub(1),
+        }
+    }
+
     fn push(&mut self, record: CommandRecord) {
         if self.max_commands == 0 {
             return;
@@ -151,4 +183,13 @@ fn open_record(open: &OpenCommand) -> CommandRecord {
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn age_seconds(rfc3339: &str) -> Option<f64> {
+    let parsed = DateTime::parse_from_rfc3339(rfc3339).ok()?;
+    let elapsed = Utc::now()
+        .signed_duration_since(parsed.with_timezone(&Utc))
+        .num_milliseconds() as f64
+        / 1000.0;
+    Some(elapsed.max(0.0))
 }

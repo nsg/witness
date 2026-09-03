@@ -80,6 +80,7 @@ All endpoints return JSON (except `/docs.md`, which returns Markdown). Every end
 | `GET /commands?since=<id>` | yes | Command records with `id > since` (default `0`). Includes the running command. |
 | `GET /commands/<id>` | yes | A single record, or `404`. |
 | `GET /tail?n=<count>` | yes | The last `n` completed records (default `20`), newest last. |
+| `GET /status` | yes | Tiny polling payload: newest command id, its time, `age_seconds`, `running`, `count`. |
 
 Add `&strip_ansi=true` to `/commands` and `/tail` for plain-text output.
 

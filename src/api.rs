@@ -64,6 +64,7 @@ pub fn router(store: Arc<Mutex<Store>>, token: String, public_host: String, port
         .route("/commands", get(commands))
         .route("/commands/{id}", get(command))
         .route("/tail", get(tail))
+        .route("/status", get(status))
         .route("/docs.md", get(docs))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&token),
@@ -118,6 +119,11 @@ async fn tail(State(state): State<AppState>, uri: Uri) -> impl IntoResponse {
     let mut records = state.store.lock().unwrap().tail(query.n);
     maybe_strip_outputs(&mut records, query.strip_ansi);
     Json(records).into_response()
+}
+
+async fn status(State(state): State<AppState>) -> impl IntoResponse {
+    let status = state.store.lock().unwrap().status();
+    Json(status).into_response()
 }
 
 async fn docs(State(state): State<AppState>) -> impl IntoResponse {
@@ -263,6 +269,18 @@ fn generate_docs(host: &str, port: u16, token: &str) -> String {
     .unwrap();
     writeln!(docs, "```").unwrap();
     writeln!(docs).unwrap();
+    writeln!(docs, "### `GET /status?token=<token>`").unwrap();
+    writeln!(docs).unwrap();
+    writeln!(
+        docs,
+        "Tiny polling endpoint. Returns only `last_id` (the newest command id), `last_command_at`, `age_seconds` (how long ago it was), `running`, and `count`. Poll this cheaply; when `last_id` grows, fetch the new records from `/commands?since=<lastId>`."
+    )
+    .unwrap();
+    writeln!(docs).unwrap();
+    writeln!(docs, "```sh").unwrap();
+    writeln!(docs, "curl \"{base_url}/status?token={token}\"").unwrap();
+    writeln!(docs, "```").unwrap();
+    writeln!(docs).unwrap();
     writeln!(docs, "### `GET /docs.md?token=<token>`").unwrap();
     writeln!(docs).unwrap();
     writeln!(docs, "Returns this session-specific guide.").unwrap();
@@ -310,7 +328,7 @@ fn generate_docs(host: &str, port: u16, token: &str) -> String {
     )
     .unwrap();
     writeln!(docs, "2. Remember the greatest returned `id` as `lastId`.").unwrap();
-    writeln!(docs, "3. Poll `{base_url}/commands?since=<lastId>&strip_ansi=true&token={token}` for new commands, updating `lastId` after each response.").unwrap();
+    writeln!(docs, "3. Poll `{base_url}/status?token={token}` cheaply; when its `last_id` exceeds `lastId`, fetch `{base_url}/commands?since=<lastId>&strip_ansi=true&token={token}` and update `lastId`.").unwrap();
     writeln!(docs).unwrap();
     writeln!(docs, "Alternate-screen/TUI application output, such as vim, less, or htop, is intentionally **not captured**.").unwrap();
     docs
@@ -420,6 +438,7 @@ mod tests {
             "witness ssh <host>",
             "/commands",
             "/tail",
+            "/status",
             "/health",
             "/docs.md",
         ] {
