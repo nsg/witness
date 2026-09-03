@@ -496,7 +496,11 @@ fn resolve_public_host() -> String {
 }
 
 fn looks_like_fqdn(host: &str) -> bool {
-    host.contains('.') && !host.ends_with('.')
+    if !host.contains('.') || host.ends_with('.') {
+        return false;
+    }
+    let first = host.split('.').next().unwrap_or("");
+    !first.eq_ignore_ascii_case("localhost") && !first.eq_ignore_ascii_case("ip6-localhost")
 }
 
 fn hostname(args: &[&str]) -> Option<String> {
@@ -513,13 +517,61 @@ fn hostname(args: &[&str]) -> Option<String> {
     }
 }
 
+/// Source IPv4 of the interface that carries the default route. We find the
+/// default gateway from the routing table and ask the kernel which local
+/// address it would use to reach it; if there is no gateway, fall back to
+/// letting the kernel pick a source toward a public address.
 fn primary_ipv4() -> Option<Ipv4Addr> {
+    if let Some(ip) = default_gateway_ipv4().and_then(source_ip_toward) {
+        return Some(ip);
+    }
+    source_ip_toward(Ipv4Addr::new(8, 8, 8, 8))
+}
+
+fn source_ip_toward(dest: Ipv4Addr) -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
+    socket.connect((dest, 80)).ok()?;
     match socket.local_addr().ok()?.ip() {
         IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
         _ => None,
     }
+}
+
+fn default_gateway_ipv4() -> Option<Ipv4Addr> {
+    let route = std::fs::read_to_string("/proc/net/route").ok()?;
+    parse_default_gateway(&route)
+}
+
+/// Parse the IPv4 default gateway from the contents of /proc/net/route,
+/// choosing the default route (destination 0.0.0.0) with the lowest metric.
+fn parse_default_gateway(route: &str) -> Option<Ipv4Addr> {
+    let mut best: Option<(u32, Ipv4Addr)> = None;
+    for line in route.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let _iface = fields.next()?;
+        let destination = fields.next()?;
+        let gateway = fields.next()?;
+        let _flags = fields.next()?;
+        let _refcnt = fields.next()?;
+        let _use = fields.next()?;
+        let metric = fields.next().unwrap_or("0");
+        if destination != "00000000" {
+            continue;
+        }
+        let Ok(raw) = u32::from_str_radix(gateway, 16) else {
+            continue;
+        };
+        if raw == 0 {
+            continue;
+        }
+        // /proc/net/route stores the address little-endian.
+        let ip = Ipv4Addr::from(raw.to_le_bytes());
+        let m = metric.parse::<u32>().unwrap_or(u32::MAX);
+        if best.is_none_or(|(bm, _)| m < bm) {
+            best = Some((m, ip));
+        }
+    }
+    best.map(|(_, ip)| ip)
 }
 
 /// Reverse-resolve an IPv4 address to a hostname via local DNS, bounded by a
@@ -566,6 +618,32 @@ mod tests {
         assert!(looks_like_fqdn("foo.example.com"));
         assert!(!looks_like_fqdn("foo"));
         assert!(!looks_like_fqdn("host."));
+    }
+
+    #[test]
+    fn fqdn_rejects_localhost_labels() {
+        assert!(!looks_like_fqdn("localhost.lan.example.net"));
+        assert!(!looks_like_fqdn("localhost"));
+        assert!(!looks_like_fqdn("ip6-localhost.example.com"));
+        assert!(looks_like_fqdn("host.localhost.example.com"));
+    }
+
+    #[test]
+    fn parses_default_gateway_from_proc_route() {
+        let route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+             enp5s0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+             enp5s0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(
+            super::parse_default_gateway(route),
+            Some(std::net::Ipv4Addr::new(192, 168, 1, 1))
+        );
+    }
+
+    #[test]
+    fn no_default_gateway_when_absent() {
+        let route = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+             enp5s0\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+        assert_eq!(super::parse_default_gateway(route), None);
     }
 
     #[test]
