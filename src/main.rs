@@ -267,6 +267,7 @@ __witness_precmd() {
 }
 __witness_arm() {
   __witness_armed=1
+  __witness_prev_hist="$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)"
   case "$PS1" in
     *"(witness)"*) : ;;
     *) PS1="\[\033[1;38;5;208m\](witness)\[\033[0m\] $PS1" ;;
@@ -278,7 +279,26 @@ __witness_preexec() {
   [ "$__witness_armed" = 1 ] || return
   __witness_armed=0
   __witness_open=1
-  printf '\033]1337;witness;B;%s\007' "$BASH_COMMAND"
+  # BASH_COMMAND is only the first simple command of a compound line, so
+  # prefer the full line bash just appended to history. If the history entry
+  # did not change (ignorespace, history off), only trust it when it still
+  # contains BASH_COMMAND (ignoredups repeat); otherwise fall back.
+  local __cur __cmd __text=""
+  __cmd="$BASH_COMMAND"
+  __cur="$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)"
+  if [ -n "$__cur" ]; then
+    if [[ "$__cur" =~ ^[[:space:]]*[0-9]+\*?[[:space:]]+(.*)$ ]]; then
+      __text="${BASH_REMATCH[1]}"
+    fi
+    if [ -n "$__text" ]; then
+      if [ "$__cur" != "$__witness_prev_hist" ]; then
+        __cmd="$__text"
+      elif [[ "$__text" == *"$BASH_COMMAND"* ]]; then
+        __cmd="$__text"
+      fi
+    fi
+  fi
+  printf '\033]1337;witness;B;%s\007' "$__cmd"
 }
 trap '__witness_preexec' DEBUG
 PROMPT_COMMAND="__witness_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};__witness_arm"
