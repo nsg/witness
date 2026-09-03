@@ -31,6 +31,8 @@ untouched, and their alternate-screen output is intentionally left out of the re
 - `witness ssh <host>` extends tagging to a remote shell — remote commands appear in the
   same timeline. Only a small marker-printing hook is injected; nothing is installed remotely.
 - A colored `(witness)` prompt prefix so you always know a session is being recorded.
+- Tagging survives privilege changes — `sudo -i`, `sudo -s`, `su`, and nested shells stay
+  recorded (witness transparently re-installs the hook in the new shell).
 
 ## Quick Start
 

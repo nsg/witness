@@ -8,6 +8,7 @@ use std::{
     io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
     os::fd::AsRawFd,
+    os::unix::fs::PermissionsExt,
     os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command as ProcessCommand, ExitCode},
@@ -125,10 +126,15 @@ async fn main() -> ExitCode {
 
 async fn run(args: RunArgs) -> Result<u8> {
     let mut rcfile = NamedTempFile::new().context("failed to create temporary bash rcfile")?;
+    let hook_path = rcfile.path().to_string_lossy().into_owned();
     rcfile
-        .write_all(witness_hook_rc().as_bytes())
+        .write_all(witness_hook_rc(&hook_path).as_bytes())
         .context("failed to write temporary bash rcfile")?;
     rcfile.flush().context("failed to flush bash rcfile")?;
+    rcfile
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o644))
+        .context("failed to set bash rcfile permissions")?;
     let child_argv = vec![
         args.shell.clone().into_os_string(),
         OsString::from("--rcfile"),
@@ -241,8 +247,10 @@ fn session_child_env() -> Vec<(String, String)> {
     vec![("WITNESS_SESSION".to_owned(), "1".to_owned())]
 }
 
-fn witness_hook_rc() -> String {
-    r#"# witness integration
+fn witness_hook_rc(hook_path: &str) -> String {
+    r#"export WITNESS_HOOK='__WITNESS_HOOK_PATH__'
+export WITNESS_SESSION=1
+# witness integration
 if [ -f /etc/bash.bashrc ]; then source /etc/bash.bashrc; fi
 if [ -f "$HOME/.bashrc" ]; then source "$HOME/.bashrc"; fi
 __witness_armed=0
@@ -272,8 +280,67 @@ __witness_preexec() {
 }
 trap '__witness_preexec' DEBUG
 PROMPT_COMMAND="__witness_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};__witness_arm"
+
+# --- keep hooks across privilege changes into a new interactive shell ---
+# trap/PROMPT_COMMAND do not survive exec into a fresh shell, so wrap sudo/su to
+# relaunch an interactive bash that re-sources our hook. On ANY doubt, fall
+# through to the real command so normal sudo/su usage is never altered. These are
+# functions, so scripts (which do not inherit functions) call the real binaries.
+sudo() {
+  if [ -z "$WITNESS_HOOK" ] || ! command -v sudo >/dev/null 2>&1; then command sudo "$@"; return; fi
+  local a want=0 complex=0 expect=0 found=0
+  local -a rest=()
+  for a in "$@"; do
+    if [ "$found" = 1 ]; then rest+=("$a"); continue; fi
+    if [ "$expect" = 1 ]; then expect=0; continue; fi
+    case "$a" in
+      -i|--login|-s|--shell) want=1 ;;
+      -H|-E|-k|-K|-n|-b|-S|-A|-P|--) : ;;
+      -u|--user|-g|--group|-C|--close-from|-c|-p|--prompt|-r|--role|-t|--type|-T|--command-timeout|-R|--chroot|-h|--host|-D|-U) complex=1; expect=1 ;;
+      -*) complex=1 ;;
+      *) found=1; rest=("$a") ;;
+    esac
+  done
+  if [ "$complex" = 0 ]; then
+    if [ "${#rest[@]}" = 0 ] && [ "$want" = 1 ]; then
+      command sudo -H bash --rcfile "$WITNESS_HOOK" -i; return
+    fi
+    case "${rest[0]:-}" in
+      bash|sh|zsh)
+        if [ "${#rest[@]}" = 1 ]; then command sudo -H bash --rcfile "$WITNESS_HOOK" -i; return; fi ;;
+      su)
+        local ok=1 x
+        for x in "${rest[@]:1}"; do
+          case "$x" in
+            -|-l|--login|-s|--shell|-m|-p|--preserve-environment) : ;;
+            *) ok=0 ;;
+          esac
+        done
+        [ "$ok" = 1 ] && { command sudo -H bash --rcfile "$WITNESS_HOOK" -i; return; } ;;
+    esac
+  fi
+  command sudo "$@"
+}
+su() {
+  if [ -z "$WITNESS_HOOK" ]; then command su "$@"; return; fi
+  local a user="" login="" bail=0
+  for a in "$@"; do
+    case "$a" in
+      -|-l|--login) login="-" ;;
+      -m|-p|--preserve-environment|-s|--shell) : ;;
+      -c|--command|--session-command) bail=1 ;;
+      -*) bail=1 ;;
+      *) if [ -z "$user" ]; then user="$a"; else bail=1; fi ;;
+    esac
+  done
+  if [ "$bail" = 0 ]; then
+    command su ${login:+-} ${user:+"$user"} -c "exec bash --rcfile $WITNESS_HOOK -i"
+    return
+  fi
+  command su "$@"
+}
 "#
-    .to_owned()
+    .replace("__WITNESS_HOOK_PATH__", hook_path)
 }
 
 fn base64_encode(input: &[u8]) -> String {
@@ -300,9 +367,17 @@ fn base64_encode(input: &[u8]) -> String {
 }
 
 fn remote_bootstrap() -> String {
-    let encoded = base64_encode(witness_hook_rc().as_bytes());
+    let mut random = [0_u8; 8];
+    rand::rng().fill_bytes(&mut random);
+    let mut hex = String::with_capacity(16);
+    for byte in random {
+        use std::fmt::Write as _;
+        write!(hex, "{byte:02x}").unwrap();
+    }
+    let hook_path = format!("/tmp/.witness-hook.{hex}.sh");
+    let encoded = base64_encode(witness_hook_rc(&hook_path).as_bytes());
     format!(
-        "__W=$(mktemp 2>/dev/null || echo \"/tmp/.witness.$$\") && printf %s '{encoded}' | base64 -d > \"$__W\" && bash --rcfile \"$__W\" -i; rm -f \"$__W\""
+        "__W='{hook_path}'; printf %s '{encoded}' | base64 -d > \"$__W\" && chmod 644 \"$__W\" && bash --rcfile \"$__W\" -i; rm -f \"$__W\""
     )
 }
 
@@ -515,12 +590,25 @@ mod tests {
 
     #[test]
     fn hook_contains_command_lifecycle_functions() {
-        let hook = witness_hook_rc();
+        let hook = witness_hook_rc("/tmp/x.sh");
         for expected in [
             "__witness_arm",
             "__witness_precmd",
             "trap '__witness_preexec' DEBUG",
             "PROMPT_COMMAND=",
+        ] {
+            assert!(hook.contains(expected), "hook is missing {expected}");
+        }
+    }
+
+    #[test]
+    fn hook_contains_privilege_change_wrappers() {
+        let hook = witness_hook_rc("/tmp/x.sh");
+        for expected in [
+            "export WITNESS_HOOK='/tmp/x.sh'",
+            "sudo()",
+            "su()",
+            "--rcfile \"$WITNESS_HOOK\"",
         ] {
             assert!(hook.contains(expected), "hook is missing {expected}");
         }
