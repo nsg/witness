@@ -1,6 +1,6 @@
 <div align="center">
   <h1>witness</h1>
-  <p>Wrap your shell, tag every command, and let an agent read your terminal over a read-only REST API.</p>
+  <p>Wrap your shell, tag every command, and collaborate through an observational REST API with human-approved suggestions.</p>
 
   [![AI usage: vibe](https://nsg.github.io/aibadge/vibe.svg)](https://nsg.github.io/aibadge/#vibe)
   [![CI](https://github.com/nsg/witness/actions/workflows/ci.yml/badge.svg)](https://github.com/nsg/witness/actions/workflows/ci.yml)
@@ -10,12 +10,13 @@
 
 `witness` wraps an interactive shell inside a PTY and records every command you run —
 assigning each an incrementing id, timestamps, exit code, and captured output. It exposes
-that record through a small **read-only**, token-authenticated REST API.
+that record through a small, token-authenticated REST API designed for observation and
+human-approved suggestions.
 
 The point is collaborative troubleshooting: start `witness`, hand the printed URL to an
 external agent, and it can "look at your screen" — observing the commands you run and their
-output to help you debug — without ever being able to execute anything. Input only ever flows
-from you to your shell; the API is strictly observational.
+output to help you debug — without ever being able to execute anything. An agent may queue inert
+command text, but only your local Ctrl-G can insert it and only your Enter can run it.
 
 Your shell behaves exactly as normal. Full-screen apps (`vim`, `less`, `htop`, `fzf`) work
 untouched, and their alternate-screen output is intentionally left out of the record.
@@ -24,7 +25,9 @@ untouched, and their alternate-screen output is intentionally left out of the re
 
 - Transparent PTY wrapper — your shell, prompt, and TUIs work as usual.
 - Per-command records: id, start/finish time (RFC3339), exit code, captured output.
-- Read-only REST API with bearer-token auth (header **or** `?token=` query param).
+- Observational REST API with bearer-token auth (header **or** `?token=` query param).
+- Agent can *suggest* commands (`POST /suggest`) — you review them at your prompt with Ctrl-G
+  and decide; nothing ever executes without your Enter. Works over SSH and sudo too.
 - Auto-selected free port and `0.0.0.0` bind, so multiple sessions run side by side.
 - Self-documenting: `GET /docs.md?token=…` returns a dynamic guide for the agent.
 - `strip_ansi=true` for clean, plain-text output.
@@ -58,7 +61,7 @@ witness run
 `witness` prints a ready-to-paste line — give it to your agent and say *"read this"*:
 
 ```
-witness: session ready — read-only shell view for an external agent
+witness: session ready — observational shell view with human-approved suggestions
 witness: api    http://your-host:38121
 witness: token  4f3c…
 witness:
@@ -80,7 +83,14 @@ All endpoints return JSON (except `/docs.md`, which returns Markdown). Every end
 | `GET /commands?since=<id>` | yes | Command records with `id > since` (default `0`). Includes the running command. |
 | `GET /commands/<id>` | yes | A single record, or `404`. |
 | `GET /tail?n=<count>` | yes | The last `n` completed records (default `20`), newest last. |
-| `GET /status` | yes | Tiny polling payload: newest command id, its time, `age_seconds`, `running`, `count`. |
+| `GET /status` | yes | Tiny polling payload: newest command id, its time, `age_seconds`, `running`, `count`, `pending_suggestions`. |
+| `POST /suggest` | yes | Queue inert command text for human review; at most 10 may be pending. |
+| `GET /suggestions` | yes | All session suggestions, oldest first, with pending/inserted status. |
+
+Suggestions never execute automatically. After an agent posts one, witness displays a local
+notification; at your prompt, Ctrl-G inserts its sanitized text without a newline. You can edit
+it, press Enter to run it, discard it, or ignore it. Because insertion happens in the local PTY
+input path, the same flow works in shells reached through `witness ssh`, `sudo`, or `su`.
 
 Add `&strip_ansi=true` to `/commands` and `/tail` for plain-text output.
 

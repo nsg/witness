@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use parser::{MarkerParser, StreamAction};
 use rand::RngCore;
-use store::Store;
+use store::{Store, validate_suggestion};
 use tempfile::NamedTempFile;
 use tokio::sync::oneshot;
 
@@ -182,7 +182,7 @@ async fn run_session(
     let port = local_addr.port();
     let base_url = format!("http://{public_host}:{port}");
 
-    eprintln!("witness: session ready — read-only shell view for an external agent");
+    eprintln!("witness: session ready — observational shell view with human-approved suggestions");
     eprintln!("witness: api    {base_url}");
     eprintln!("witness: token  {token}");
     eprintln!("witness:");
@@ -201,17 +201,20 @@ async fn run_session(
         .try_clone()
         .context("failed to clone PTY resize handle")?;
     let writer = child.master;
+    let notifier = api::Notifier::new();
 
     let reader_store = Arc::clone(&store);
+    let reader_notifier = notifier.clone();
     let (reader_tx, reader_rx) = oneshot::channel();
     let _reader_thread = thread::spawn(move || {
-        let _ = reader_tx.send(read_pty(reader, reader_store));
+        let _ = reader_tx.send(read_pty(reader, reader_store, reader_notifier));
     });
-    let _input_thread = thread::spawn(move || copy_stdin(writer));
+    let input_store = Arc::clone(&store);
+    let _input_thread = thread::spawn(move || copy_stdin(writer, input_store));
 
     let resize_task = spawn_resize_task(resize_master);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let app = api::router(store, token, public_host, port);
+    let app = api::router(store, notifier, token, public_host, port);
     let mut server_task = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
@@ -385,21 +388,23 @@ fn ssh_argv(args: Vec<String>) -> Vec<OsString> {
     argv
 }
 
-fn read_pty(mut reader: std::fs::File, store: Arc<Mutex<Store>>) -> Result<()> {
+fn read_pty(
+    mut reader: std::fs::File,
+    store: Arc<Mutex<Store>>,
+    notifier: api::Notifier,
+) -> Result<()> {
     let mut parser = MarkerParser::new();
     let mut buffer = [0_u8; 8192];
-    let mut stdout = io::stdout().lock();
 
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
                 let parsed = parser.feed(&buffer[..count]);
-                stdout
-                    .write_all(&parsed.cleaned)
+                notifier
+                    .write(&parsed.cleaned)
                     .context("failed to write shell output")?;
-                stdout.flush().context("failed to flush shell output")?;
-                apply_actions(&store, parsed.actions);
+                apply_actions(&store, &notifier, parsed.actions)?;
             }
             Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -408,37 +413,99 @@ fn read_pty(mut reader: std::fs::File, store: Arc<Mutex<Store>>) -> Result<()> {
     }
 
     let parsed = parser.finish();
-    stdout
-        .write_all(&parsed.cleaned)
+    notifier
+        .write(&parsed.cleaned)
         .context("failed to write final shell output")?;
-    stdout
-        .flush()
-        .context("failed to flush final shell output")?;
-    apply_actions(&store, parsed.actions);
+    apply_actions(&store, &notifier, parsed.actions)?;
     store.lock().unwrap().finish_open(None);
     Ok(())
 }
 
-fn apply_actions(store: &Arc<Mutex<Store>>, actions: Vec<StreamAction>) {
+fn apply_actions(
+    store: &Arc<Mutex<Store>>,
+    notifier: &api::Notifier,
+    actions: Vec<StreamAction>,
+) -> Result<()> {
     for action in actions {
-        let mut store = store.lock().unwrap();
         match action {
-            StreamAction::Output(bytes, true) => store.append_output(&bytes),
+            StreamAction::Output(bytes, true) => store.lock().unwrap().append_output(&bytes),
             StreamAction::Output(_, false) => {}
-            StreamAction::Event(parser::ParseEvent::Begin(command)) => store.begin(command),
-            StreamAction::Event(parser::ParseEvent::End(code)) => store.end(code),
+            StreamAction::Event(parser::ParseEvent::Begin(command)) => {
+                store.lock().unwrap().begin(command)
+            }
+            StreamAction::Event(parser::ParseEvent::End(code)) => {
+                let notices = {
+                    let mut store = store.lock().unwrap();
+                    store.end(code);
+                    store.take_pending_notices()
+                };
+                for notice in notices {
+                    notifier
+                        .write(notice.as_bytes())
+                        .context("failed to write suggestion notice")?;
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InputAction {
+    Forward(Vec<u8>),
+    InsertSuggestion,
+}
+
+struct InputFilter;
+
+impl InputFilter {
+    fn feed(&mut self, chunk: &[u8]) -> Vec<InputAction> {
+        let mut actions = Vec::new();
+        let mut start = 0;
+        for (index, byte) in chunk.iter().enumerate() {
+            if *byte != 0x07 {
+                continue;
+            }
+            if start < index {
+                actions.push(InputAction::Forward(chunk[start..index].to_vec()));
+            }
+            actions.push(InputAction::InsertSuggestion);
+            start = index + 1;
+        }
+        if start < chunk.len() {
+            actions.push(InputAction::Forward(chunk[start..].to_vec()));
+        }
+        actions
     }
 }
 
-fn copy_stdin(mut writer: std::fs::File) {
+fn copy_stdin(mut writer: std::fs::File, store: Arc<Mutex<Store>>) {
     let mut stdin = io::stdin().lock();
     let mut buffer = [0_u8; 8192];
-    loop {
+    let mut filter = InputFilter;
+    'input: loop {
         match stdin.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
-                if writer.write_all(&buffer[..count]).is_err() || writer.flush().is_err() {
+                for action in filter.feed(&buffer[..count]) {
+                    let result = match action {
+                        InputAction::Forward(bytes) => writer.write_all(&bytes),
+                        InputAction::InsertSuggestion => {
+                            let suggestion = store.lock().unwrap().pop_pending_suggestion();
+                            if let Some(suggestion) = suggestion
+                                && validate_suggestion(&suggestion.command).is_ok()
+                            {
+                                writer.write_all(suggestion.command.as_bytes())
+                            } else {
+                                Ok(())
+                            }
+                        }
+                    };
+                    if result.is_err() {
+                        break 'input;
+                    }
+                }
+                if writer.flush().is_err() {
                     break;
                 }
             }
@@ -611,7 +678,52 @@ fn reverse_dns_blocking(ip: Ipv4Addr) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{base64_encode, looks_like_fqdn, remote_bootstrap, witness_hook_rc};
+    use super::{
+        InputAction, InputFilter, base64_encode, looks_like_fqdn, remote_bootstrap, witness_hook_rc,
+    };
+
+    #[test]
+    fn input_filter_forwards_plain_chunk_unchanged() {
+        let input = b"hello\x1b[A";
+        assert_eq!(
+            InputFilter.feed(input),
+            vec![InputAction::Forward(input.to_vec())]
+        );
+    }
+
+    #[test]
+    fn input_filter_splits_around_ctrl_g() {
+        assert_eq!(
+            InputFilter.feed(b"before\x07after"),
+            vec![
+                InputAction::Forward(b"before".to_vec()),
+                InputAction::InsertSuggestion,
+                InputAction::Forward(b"after".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_filter_swallows_lone_ctrl_g() {
+        assert_eq!(
+            InputFilter.feed(b"\x07"),
+            vec![InputAction::InsertSuggestion]
+        );
+    }
+
+    #[test]
+    fn input_filter_preserves_multiple_ctrl_g_actions_in_order() {
+        assert_eq!(
+            InputFilter.feed(b"a\x07\x07b\x07"),
+            vec![
+                InputAction::Forward(b"a".to_vec()),
+                InputAction::InsertSuggestion,
+                InputAction::InsertSuggestion,
+                InputAction::Forward(b"b".to_vec()),
+                InputAction::InsertSuggestion,
+            ]
+        );
+    }
 
     #[test]
     fn fqdn_requires_a_dot() {
