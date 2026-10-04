@@ -58,6 +58,11 @@ pub async fn run(
         Err(ClientFailure::WrongKey) => {
             bail!("relay handshake failed; the relay key is probably wrong")
         }
+        Err(ClientFailure::ApprovalRequired) => {
+            eprintln!(
+                "witness: the relay is waiting for a human to approve this channel — requests will retry"
+            );
+        }
         Err(ClientFailure::Unavailable | ClientFailure::Timeout) => {
             eprintln!("witness: no session is waiting on the relay yet — requests will retry");
         }
@@ -156,6 +161,10 @@ async fn forward(State(state): State<ConnectState>, request: Request) -> Respons
         Err(ClientFailure::WrongKey) => relay_error(
             StatusCode::BAD_GATEWAY,
             "relay handshake failed; the relay key is probably wrong",
+        ),
+        Err(ClientFailure::ApprovalRequired) => relay_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "waiting for a human to approve this channel on the relay; retry later",
         ),
         Err(ClientFailure::Unavailable) => {
             relay_error(StatusCode::BAD_GATEWAY, "relay unavailable")

@@ -248,6 +248,32 @@ witness run --relay https://relay.example --relay-key-file relay.key
 witness connect https://relay.example --relay-key-file relay.key
 ```
 
+### Approving agents on the relay
+
+Start the relay with `--require-approval` to put a human in the loop:
+
+```bash
+witness serve --addr 127.0.0.1:8080 --require-approval
+```
+
+An agent that connects to a channel nobody has approved is turned away, and its requests through
+`witness connect` fail with `503` until someone opens `https://relay.example/admin` and presses
+Approve. The page lists each waiting channel (the middle part of the relay key) and the address
+the agent connected from. The address comes from
+`X-Forwarded-For` when the proxy sets it, so make sure your proxy overwrites that header.
+
+An approval lasts as long as the agent keeps talking: every request pushes it forward, and after
+two hours of silence (`--approval-idle-minutes`) the channel closes again until it is approved
+once more. Revoke closes an approved channel at once, including streams already open.
+
+> [!WARNING]
+> `witness serve` does not authenticate `/admin`. Protect that path in the reverse proxy (basic
+> auth, SSO, or an allow-list) and leave `/relay/` open; anyone who can reach `/admin` can approve.
+
+This is a check on who uses the relay, enforced by the relay. It stops an agent, or someone with
+a copied key, from connecting unnoticed. It is not part of the end-to-end protection: a
+compromised relay could skip it, though it still could not read or forge traffic.
+
 ## Configuration
 
 `witness run` options:
@@ -277,8 +303,15 @@ these flags are ignored.
 | `--token <token>` | `$WITNESS_TOKEN` or random | Bearer token checked by the local API. |
 | `--relay-key-file <path>` | `$WITNESS_RELAY_KEY`, otherwise prompt | Read the relay key from this file. Takes precedence over the environment. |
 
-`witness serve` accepts `--addr <host:port>` (default `0.0.0.0:8080`), and `witness key` prints a
-fresh relay key.
+`witness serve` options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--addr <host:port>` | `0.0.0.0:8080` | Relay bind address. |
+| `--require-approval` | off | Hold each agent until a human approves its channel at `/admin`. |
+| `--approval-idle-minutes <n>` | `120` | Agent silence after which an approval lapses. |
+
+`witness key` prints a fresh relay key.
 
 The token is valid only for the running session; each session picks its own port. `witness
 token` prints a fresh random token.

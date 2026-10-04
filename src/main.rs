@@ -56,6 +56,12 @@ enum Command {
         /// Address to bind the relay to
         #[arg(long, default_value = "0.0.0.0:8080")]
         addr: SocketAddr,
+        /// Hold each agent until a human approves its channel at /admin
+        #[arg(long)]
+        require_approval: bool,
+        /// Minutes of agent silence after which an approval lapses
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
+        approval_idle_minutes: u64,
     },
     /// On the agent host, expose a relayed session on a local HTTP API
     Connect(ConnectArgs),
@@ -195,7 +201,16 @@ async fn main() -> ExitCode {
             println!("{}", tunnel::RelayKey::generate());
             ExitCode::SUCCESS
         }
-        Command::Serve { addr } => match relay::serve(addr).await {
+        Command::Serve {
+            addr,
+            require_approval,
+            approval_idle_minutes,
+        } => match relay::serve(
+            addr,
+            require_approval.then(|| Duration::from_secs(approval_idle_minutes * 60)),
+        )
+        .await
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("witness: {error:#}");

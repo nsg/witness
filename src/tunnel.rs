@@ -132,6 +132,27 @@ pub enum ClientFailure {
     Unavailable,
     Timeout,
     WrongKey,
+    ApprovalRequired,
+}
+
+/// The relay refused the agent because no human has approved the channel.
+#[derive(Debug)]
+struct ApprovalRequired;
+
+impl fmt::Display for ApprovalRequired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("waiting for approval on the relay")
+    }
+}
+
+impl std::error::Error for ApprovalRequired {}
+
+fn stream_failure(error: &anyhow::Error, otherwise: ClientFailure) -> ClientFailure {
+    if error.is::<ApprovalRequired>() {
+        ClientFailure::ApprovalRequired
+    } else {
+        otherwise
+    }
 }
 
 impl fmt::Display for ClientFailure {
@@ -142,6 +163,7 @@ impl fmt::Display for ClientFailure {
             Self::WrongKey => {
                 formatter.write_str("relay handshake failed; the relay key is probably wrong")
             }
+            Self::ApprovalRequired => formatter.write_str("waiting for approval on the relay"),
         }
     }
 }
@@ -366,7 +388,7 @@ impl TunnelClient {
             attempts -= 1;
             match self.request_once(&request).await {
                 Ok(response) => return Ok(response),
-                Err(error) if attempts > 0 && error != ClientFailure::WrongKey => {}
+                Err(ClientFailure::Unavailable | ClientFailure::Timeout) if attempts > 0 => {}
                 Err(error) => return Err(error),
             }
         }
@@ -392,10 +414,16 @@ impl TunnelClient {
                 .send(&serde_json::to_vec(request).map_err(|_| ClientFailure::Unavailable)?)
                 .await
                 .map_err(|_| ClientFailure::Unavailable)?;
-            let bytes = stream
-                .receive()
-                .await
-                .map_err(|_| ClientFailure::Unavailable)?;
+            // Once a request that must not repeat is out, an approval notice
+            // is not believed: it is unauthenticated and reads as "safe to
+            // retry", while the request may already have been carried out.
+            let bytes = stream.receive().await.map_err(|error| {
+                if request.method == "GET" {
+                    stream_failure(&error, ClientFailure::Unavailable)
+                } else {
+                    ClientFailure::Unavailable
+                }
+            })?;
             serde_json::from_slice(&bytes).map_err(|_| ClientFailure::Unavailable)
         };
         match tokio::time::timeout(REQUEST_TIMEOUT, exchange).await {
@@ -488,7 +516,7 @@ async fn initiator_handshake(
         .map_err(|_| ClientFailure::Unavailable)?;
     let incoming = receive_binary(&mut socket)
         .await
-        .map_err(|_| ClientFailure::WrongKey)?;
+        .map_err(|error| stream_failure(&error, ClientFailure::WrongKey))?;
     let read = handshake
         .read_message(&incoming, &mut output)
         .map_err(|_| ClientFailure::WrongKey)?;
@@ -538,6 +566,9 @@ async fn receive_binary(socket: &mut WebSocket) -> Result<Vec<u8>> {
             message = socket.next() => match message {
                 Some(Ok(Message::Binary(bytes))) => return Ok(bytes.to_vec()),
                 Some(Ok(Message::Ping(bytes))) => socket.send(Message::Pong(bytes)).await?,
+                Some(Ok(Message::Text(text))) if text.as_str() == crate::relay::APPROVAL_HINT => {
+                    return Err(ApprovalRequired.into());
+                }
                 Some(Ok(Message::Text(_) | Message::Pong(_) | Message::Frame(_))) => {}
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => bail!("WebSocket closed"),
             },
@@ -733,7 +764,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let relay_task = tokio::spawn(async move {
-            axum::serve(listener, relay::router()).await.unwrap();
+            axum::serve(listener, relay::router(None)).await.unwrap();
         });
 
         let store = Arc::new(StdMutex::new(Store::new(10, 1024)));
