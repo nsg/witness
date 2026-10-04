@@ -50,15 +50,15 @@ Build from source (Rust stable):
 cargo build --release
 ```
 
-Or grab the latest prebuilt Linux binary:
+Or install the latest prebuilt Linux binary:
 
 ```bash
-curl -fsSL https://github.com/nsg/witness/releases/latest/download/witness-linux-glibc -o ~/bin/witness
-chmod +x ~/bin/witness
+curl -fsSL https://raw.githubusercontent.com/nsg/witness/master/install.sh | bash
 ```
 
-That build needs glibc 2.39 or newer. On older systems, such as Ubuntu 22.04,
-download `witness-linux-glibc2.35` instead.
+The script picks the build that matches this system's glibc. Run it again to
+update: a `witness` already in `PATH` is replaced in place, otherwise it goes to
+`~/.local/bin` or `~/bin`. Set `WITNESS_INSTALL_DIR` to install somewhere else.
 
 Start a session:
 

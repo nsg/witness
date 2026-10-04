@@ -93,12 +93,11 @@ jobs:
             echo "## Installation"
             echo ""
             echo '```bash'
-            echo 'curl -fsSL https://github.com/nsg/witness/releases/latest/download/witness-linux-glibc -o ~/bin/witness'
-            echo 'chmod +x ~/bin/witness'
+            echo 'curl -fsSL https://raw.githubusercontent.com/nsg/witness/master/install.sh | bash'
             echo '```'
             echo ""
-            echo "On older systems that fail with \`GLIBC_2.39' not found\`, such as"
-            echo "Ubuntu 22.04, use \`witness-linux-glibc2.35\` instead."
+            echo "The script picks the build that matches the system's glibc, and"
+            echo "updates an existing install when run again."
             echo ""
             echo "## Recent Changes"
             echo ""
