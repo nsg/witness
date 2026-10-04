@@ -5,11 +5,21 @@ on:
     branches: ['master']
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            artifact: witness-linux-glibc
+          # A glibc binary only runs on the glibc it was linked against or
+          # newer, so older distributions get a build from an older runner.
+          - runner: ubuntu-22.04
+            artifact: witness-linux-glibc2.35
+            max_glibc: '2.35'
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -26,17 +36,51 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-release-
+          key: ${{ matrix.runner }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.runner }}-cargo-release-
 
       - name: Build release binary
         run: cargo build --release
 
-      - name: Package artifacts
+      - name: Check required glibc version
+        if: matrix.max_glibc
+        env:
+          MAX_GLIBC: ${{ matrix.max_glibc }}
+        run: |
+          required=$(objdump -T target/release/witness \
+            | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -1)
+          echo "Binary requires glibc $required, limit is $MAX_GLIBC"
+          [ "$(printf '%s\n' "$required" "$MAX_GLIBC" | sort -V | tail -1)" = "$MAX_GLIBC" ]
+
+      - name: Package artifact
         run: |
           mkdir -p dist
-          cp target/release/witness dist/witness-linux-glibc
-          (cd dist && sha256sum witness-linux-glibc > sha256sums.txt)
+          cp target/release/witness "dist/${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        run: cd dist && sha256sum witness-linux-* > sha256sums.txt
 
       - name: Create or update release
         env:
@@ -53,10 +97,13 @@ jobs:
             echo 'chmod +x ~/bin/witness'
             echo '```'
             echo ""
+            echo "On older systems that fail with \`GLIBC_2.39' not found\`, such as"
+            echo "Ubuntu 22.04, use \`witness-linux-glibc2.35\` instead."
+            echo ""
             echo "## Recent Changes"
             echo ""
             echo '```'
             git log --oneline -20
             echo '```'
           } | gh release create latest --title "Latest" --notes-file - \
-            dist/witness-linux-glibc dist/sha256sums.txt
+            dist/witness-linux-glibc dist/witness-linux-glibc2.35 dist/sha256sums.txt

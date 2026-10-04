@@ -57,6 +57,9 @@ curl -fsSL https://github.com/nsg/witness/releases/latest/download/witness-linux
 chmod +x ~/bin/witness
 ```
 
+That build needs glibc 2.39 or newer. On older systems, such as Ubuntu 22.04,
+download `witness-linux-glibc2.35` instead.
+
 Start a session:
 
 ```bash
