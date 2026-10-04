@@ -1,4 +1,6 @@
 mod api;
+mod audit;
+mod auto;
 mod parser;
 mod pty;
 mod store;
@@ -18,6 +20,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use audit::{AuditEvent, AuditLog};
+use auto::AutoApprover;
 use clap::{Args, Parser, Subcommand};
 use parser::{MarkerParser, StreamAction};
 use rand::RngCore;
@@ -38,6 +42,8 @@ enum Command {
     Run(RunArgs),
     /// Open an SSH session with witness hooks installed on the remote shell
     Ssh {
+        #[command(flatten)]
+        approval: ApprovalArgs,
         /// Arguments passed through to ssh (host and any ssh options)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
@@ -66,6 +72,21 @@ struct RunArgs {
     /// Maximum captured output bytes per command
     #[arg(long, default_value_t = 1_048_576)]
     max_output_bytes: usize,
+    #[command(flatten)]
+    approval: ApprovalArgs,
+}
+
+#[derive(Args)]
+struct ApprovalArgs {
+    /// Run agent suggestions as soon as the prompt is idle instead of waiting
+    /// for Ctrl-G. DANGEROUS: anyone holding the token can execute commands
+    #[arg(long)]
+    auto_approve: bool,
+    /// Append every command and suggestion to this JSON Lines audit log
+    /// (always on with --auto-approve; defaults to
+    /// $XDG_STATE_HOME/witness/audit.log)
+    #[arg(long)]
+    audit_log: Option<PathBuf>,
 }
 
 struct Config {
@@ -74,6 +95,25 @@ struct Config {
     token: Option<String>,
     max_commands: usize,
     max_output_bytes: usize,
+    auto_approve: bool,
+    audit_log: Option<PathBuf>,
+}
+
+/// Handles shared by the PTY reader, the stdin copier, and the API.
+#[derive(Clone)]
+struct Session {
+    store: Arc<Mutex<Store>>,
+    notifier: api::Notifier,
+    audit: Option<Arc<AuditLog>>,
+    auto: Option<Arc<AutoApprover>>,
+}
+
+impl Session {
+    fn audit(&self, event: &AuditEvent) {
+        if let Some(audit) = &self.audit {
+            audit.record_or_warn(&self.notifier, event);
+        }
+    }
 }
 
 impl Default for Config {
@@ -84,6 +124,8 @@ impl Default for Config {
             token: None,
             max_commands: 10_000,
             max_output_bytes: 1_048_576,
+            auto_approve: false,
+            audit_log: None,
         }
     }
 }
@@ -96,6 +138,8 @@ impl From<&RunArgs> for Config {
             token: args.token.clone(),
             max_commands: args.max_commands,
             max_output_bytes: args.max_output_bytes,
+            auto_approve: args.approval.auto_approve,
+            audit_log: args.approval.audit_log.clone(),
         }
     }
 }
@@ -114,7 +158,7 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Ssh { args } => match ssh(args).await {
+        Command::Ssh { approval, args } => match ssh(approval, args).await {
             Ok(code) => ExitCode::from(code),
             Err(error) => {
                 eprintln!("witness: {error:#}");
@@ -143,15 +187,25 @@ async fn run(args: RunArgs) -> Result<u8> {
     run_session(&child_argv, &session_child_env(), &Config::from(&args)).await
 }
 
-async fn ssh(args: Vec<String>) -> Result<u8> {
+async fn ssh(approval: ApprovalArgs, args: Vec<String>) -> Result<u8> {
     let child_argv = ssh_argv(args);
     if std::env::var_os("WITNESS_SESSION").is_some() {
+        if approval.auto_approve || approval.audit_log.is_some() {
+            eprintln!(
+                "witness: already inside a session; --auto-approve and --audit-log are set by the outer `witness run` and ignored here"
+            );
+        }
         let error = ProcessCommand::new(&child_argv[0])
             .args(&child_argv[1..])
             .exec();
         return Err(error).context("failed to exec ssh");
     }
-    run_session(&child_argv, &session_child_env(), &Config::default()).await
+    let cfg = Config {
+        auto_approve: approval.auto_approve,
+        audit_log: approval.audit_log,
+        ..Config::default()
+    };
+    run_session(&child_argv, &session_child_env(), &cfg).await
 }
 
 async fn run_session(
@@ -169,6 +223,24 @@ async fn run_session(
         cfg.max_commands,
         cfg.max_output_bytes,
     )));
+    let audit_path = match &cfg.audit_log {
+        Some(path) => Some(path.clone()),
+        None if cfg.auto_approve => Some(
+            audit::default_path()
+                .context("no default audit log location; pass --audit-log <path>")?,
+        ),
+        None => None,
+    };
+    let audit = audit_path
+        .map(|path| AuditLog::open(&path).map(Arc::new))
+        .transpose()?;
+    if let Some(audit) = &audit {
+        audit
+            .record(&AuditEvent::SessionStarted {
+                auto_approve: cfg.auto_approve,
+            })
+            .with_context(|| format!("failed to write audit log {}", audit.path().display()))?;
+    }
     let listener = TcpListener::bind(cfg.addr)
         .with_context(|| format!("failed to bind HTTP API to {}", cfg.addr))?;
     let local_addr = listener
@@ -182,9 +254,21 @@ async fn run_session(
     let port = local_addr.port();
     let base_url = format!("http://{public_host}:{port}");
 
-    eprintln!("witness: session ready — observational shell view with human-approved suggestions");
+    if cfg.auto_approve {
+        eprintln!(
+            "witness: session ready — AUTO-APPROVE: agent suggestions run without confirmation"
+        );
+        eprintln!("witness: anyone holding the token below can execute commands as you");
+    } else {
+        eprintln!(
+            "witness: session ready — observational shell view with human-approved suggestions"
+        );
+    }
     eprintln!("witness: api    {base_url}");
     eprintln!("witness: token  {token}");
+    if let Some(audit) = &audit {
+        eprintln!("witness: audit  {}", audit.path().display());
+    }
     eprintln!("witness:");
     eprintln!("witness: give your agent this URL and say \"read this\":");
     eprintln!("witness:   {base_url}/docs.md?token={token}");
@@ -200,21 +284,43 @@ async fn run_session(
         .master
         .try_clone()
         .context("failed to clone PTY resize handle")?;
-    let writer = child.master;
+    let writer = Arc::new(Mutex::new(child.master));
     let notifier = api::Notifier::new();
+    let auto = match &audit {
+        Some(audit) if cfg.auto_approve => Some(Arc::new(AutoApprover::new(
+            Arc::clone(&store),
+            notifier.clone(),
+            Arc::clone(audit),
+            Arc::clone(&writer),
+        ))),
+        _ => None,
+    };
+    let session = Session {
+        store,
+        notifier,
+        audit,
+        auto,
+    };
 
-    let reader_store = Arc::clone(&store);
-    let reader_notifier = notifier.clone();
+    let reader_session = session.clone();
     let (reader_tx, reader_rx) = oneshot::channel();
     let _reader_thread = thread::spawn(move || {
-        let _ = reader_tx.send(read_pty(reader, reader_store, reader_notifier));
+        let _ = reader_tx.send(read_pty(reader, reader_session));
     });
-    let input_store = Arc::clone(&store);
-    let _input_thread = thread::spawn(move || copy_stdin(writer, input_store));
+    let input_session = session.clone();
+    let _input_thread = thread::spawn(move || copy_stdin(writer, input_session));
 
     let resize_task = spawn_resize_task(resize_master);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let app = api::router(store, notifier, token, public_host, port);
+    let app = api::router(
+        session.store,
+        session.notifier,
+        session.audit,
+        session.auto,
+        token,
+        public_host,
+        port,
+    );
     let mut server_task = tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async {
@@ -268,6 +374,7 @@ __witness_precmd() {
 __witness_arm() {
   __witness_armed=1
   __witness_prev_hist="$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)"
+  printf '\033]1337;witness;P\007'
   case "$PS1" in
     *"(witness)"*) : ;;
     *) PS1="\[\033[1;38;5;208m\](witness)\[\033[0m\] $PS1" ;;
@@ -408,11 +515,7 @@ fn ssh_argv(args: Vec<String>) -> Vec<OsString> {
     argv
 }
 
-fn read_pty(
-    mut reader: std::fs::File,
-    store: Arc<Mutex<Store>>,
-    notifier: api::Notifier,
-) -> Result<()> {
+fn read_pty(mut reader: std::fs::File, session: Session) -> Result<()> {
     let mut parser = MarkerParser::new();
     let mut buffer = [0_u8; 8192];
 
@@ -421,10 +524,11 @@ fn read_pty(
             Ok(0) => break,
             Ok(count) => {
                 let parsed = parser.feed(&buffer[..count]);
-                notifier
+                session
+                    .notifier
                     .write(&parsed.cleaned)
                     .context("failed to write shell output")?;
-                apply_actions(&store, &notifier, parsed.actions)?;
+                apply_actions(&session, parsed.actions)?;
             }
             Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -433,36 +537,54 @@ fn read_pty(
     }
 
     let parsed = parser.finish();
-    notifier
+    session
+        .notifier
         .write(&parsed.cleaned)
         .context("failed to write final shell output")?;
-    apply_actions(&store, &notifier, parsed.actions)?;
-    store.lock().unwrap().finish_open(None);
+    apply_actions(&session, parsed.actions)?;
+    finish_command(&session, None);
     Ok(())
 }
 
-fn apply_actions(
-    store: &Arc<Mutex<Store>>,
-    notifier: &api::Notifier,
-    actions: Vec<StreamAction>,
-) -> Result<()> {
+fn finish_command(session: &Session, exit_code: Option<i32>) {
+    let finished = session.store.lock().unwrap().finish_open(exit_code);
+    if let Some(command_id) = finished {
+        session.audit(&AuditEvent::CommandFinished {
+            command_id,
+            exit_code,
+        });
+    }
+}
+
+fn apply_actions(session: &Session, actions: Vec<StreamAction>) -> Result<()> {
     for action in actions {
         match action {
-            StreamAction::Output(bytes, true) => store.lock().unwrap().append_output(&bytes),
+            StreamAction::Output(bytes, true) => {
+                session.store.lock().unwrap().append_output(&bytes)
+            }
             StreamAction::Output(_, false) => {}
             StreamAction::Event(parser::ParseEvent::Begin(command)) => {
-                store.lock().unwrap().begin(command)
+                finish_command(session, None);
+                let command_id = session.store.lock().unwrap().begin(command.clone());
+                session.audit(&AuditEvent::CommandStarted {
+                    command_id,
+                    command: &command,
+                });
             }
             StreamAction::Event(parser::ParseEvent::End(code)) => {
-                let notices = {
-                    let mut store = store.lock().unwrap();
-                    store.end(code);
-                    store.take_pending_notices()
-                };
+                finish_command(session, Some(code));
+                let notices = session.store.lock().unwrap().take_pending_notices();
                 for notice in notices {
-                    notifier
+                    session
+                        .notifier
                         .write(notice.as_bytes())
                         .context("failed to write suggestion notice")?;
+                }
+            }
+            StreamAction::Event(parser::ParseEvent::Prompt) => {
+                session.store.lock().unwrap().prompt_shown();
+                if let Some(auto) = &session.auto {
+                    auto.dispatch_next();
                 }
             }
         }
@@ -499,22 +621,30 @@ impl InputFilter {
     }
 }
 
-fn copy_stdin(mut writer: std::fs::File, store: Arc<Mutex<Store>>) {
+fn copy_stdin(writer: Arc<Mutex<std::fs::File>>, session: Session) {
     let mut stdin = io::stdin().lock();
     let mut buffer = [0_u8; 8192];
     let mut filter = InputFilter;
-    'input: loop {
+    loop {
         match stdin.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
+                let mut writer = writer.lock().unwrap();
+                // Anything typed makes the prompt the human's: auto-approved
+                // suggestions wait for the next fresh one.
+                session.store.lock().unwrap().note_input(&buffer[..count]);
                 for action in filter.feed(&buffer[..count]) {
                     let result = match action {
                         InputAction::Forward(bytes) => writer.write_all(&bytes),
                         InputAction::InsertSuggestion => {
-                            let suggestion = store.lock().unwrap().pop_pending_suggestion();
+                            let suggestion = session.store.lock().unwrap().pop_pending_suggestion();
                             if let Some(suggestion) = suggestion
                                 && validate_suggestion(&suggestion.command).is_ok()
                             {
+                                session.audit(&AuditEvent::Inserted {
+                                    suggestion_id: suggestion.id,
+                                    command: &suggestion.command,
+                                });
                                 writer.write_all(suggestion.command.as_bytes())
                             } else {
                                 Ok(())
@@ -522,11 +652,17 @@ fn copy_stdin(mut writer: std::fs::File, store: Arc<Mutex<Store>>) {
                         }
                     };
                     if result.is_err() {
-                        break 'input;
+                        return;
                     }
                 }
                 if writer.flush().is_err() {
                     break;
+                }
+                drop(writer);
+                // A prompt that appeared while the writer was held could not
+                // dispatch; pick it up now.
+                if let Some(auto) = &session.auto {
+                    auto.dispatch_next();
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -698,8 +834,11 @@ fn reverse_dns_blocking(ip: Ipv4Addr) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser as _;
+
     use super::{
-        InputAction, InputFilter, base64_encode, looks_like_fqdn, remote_bootstrap, witness_hook_rc,
+        Cli, Command, InputAction, InputFilter, base64_encode, looks_like_fqdn, remote_bootstrap,
+        witness_hook_rc,
     };
 
     #[test]
@@ -743,6 +882,23 @@ mod tests {
                 InputAction::InsertSuggestion,
             ]
         );
+    }
+
+    #[test]
+    fn ssh_takes_witness_flags_before_the_host_and_passes_the_rest_through() {
+        let cli = Cli::parse_from(["witness", "ssh", "--auto-approve", "-p", "2222", "host"]);
+        let Command::Ssh { approval, args } = cli.command else {
+            panic!("expected ssh");
+        };
+        assert!(approval.auto_approve);
+        assert_eq!(args, ["-p", "2222", "host"]);
+
+        let cli = Cli::parse_from(["witness", "ssh", "host", "--auto-approve"]);
+        let Command::Ssh { approval, args } = cli.command else {
+            panic!("expected ssh");
+        };
+        assert!(!approval.auto_approve);
+        assert_eq!(args, ["host", "--auto-approve"]);
     }
 
     #[test]

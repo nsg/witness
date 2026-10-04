@@ -18,7 +18,13 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use crate::store::{CommandRecord, Store, SuggestError, Suggestion, validate_suggestion};
+use crate::{
+    audit::{AuditEvent, AuditLog},
+    auto::AutoApprover,
+    store::{
+        CommandRecord, Store, SuggestError, Suggestion, SuggestionStatus, validate_suggestion,
+    },
+};
 
 #[derive(Clone, Default)]
 pub struct Notifier {
@@ -42,6 +48,8 @@ impl Notifier {
 struct AppState {
     store: Arc<Mutex<Store>>,
     notifier: Notifier,
+    audit: Option<Arc<AuditLog>>,
+    auto: Option<Arc<AutoApprover>>,
     public_host: Arc<str>,
     port: u16,
     token: Arc<str>,
@@ -87,6 +95,8 @@ struct ErrorBody {
 pub fn router(
     store: Arc<Mutex<Store>>,
     notifier: Notifier,
+    audit: Option<Arc<AuditLog>>,
+    auto: Option<Arc<AutoApprover>>,
     token: String,
     public_host: String,
     port: u16,
@@ -112,6 +122,8 @@ pub fn router(
         .with_state(AppState {
             store,
             notifier,
+            audit,
+            auto,
             public_host: Arc::from(public_host),
             port,
             token,
@@ -162,22 +174,24 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn suggest(State(state): State<AppState>, Json(body): Json<SuggestBody>) -> Response {
-    if let Err(error) = validate_suggestion(&body.command) {
+    let invalid = validate_suggestion(&body.command).err().or_else(|| {
+        body.reason
+            .as_deref()
+            .is_some_and(|reason| reason.chars().any(char::is_control))
+            .then_some("control characters not allowed")
+    });
+    if let Some(error) = invalid {
+        state.audit_rejection(&body.command, error);
         return bad_request(error).into_response();
-    }
-    if body
-        .reason
-        .as_deref()
-        .is_some_and(|reason| reason.chars().any(char::is_control))
-    {
-        return bad_request("control characters not allowed").into_response();
     }
 
     let (suggestion, immediate_notice) = {
         let mut store = state.store.lock().unwrap();
-        let suggestion = match store.add_suggestion(body.command, body.reason) {
+        let suggestion = match store.add_suggestion(body.command.clone(), body.reason) {
             Ok(suggestion) => suggestion,
             Err(SuggestError::QueueFull) => {
+                drop(store);
+                state.audit_rejection(&body.command, "queue full");
                 return (
                     StatusCode::CONFLICT,
                     Json(ErrorBody {
@@ -187,20 +201,75 @@ async fn suggest(State(state): State<AppState>, Json(body): Json<SuggestBody>) -
                     .into_response();
             }
         };
-        let notice = render_suggestion_notice(&suggestion);
-        let immediate_notice = if store.command_is_open() {
-            store.push_pending_notice(notice);
+        let immediate_notice = if state.auto.is_some() {
             None
         } else {
-            Some(notice)
+            let notice = render_suggestion_notice(&suggestion);
+            if store.command_is_open() {
+                store.push_pending_notice(notice);
+                None
+            } else {
+                Some(notice)
+            }
         };
+        // Logged before the lock is released so it always precedes the
+        // entries for running it.
+        if let Some(audit) = &state.audit {
+            audit.record_or_warn(
+                &state.notifier,
+                &AuditEvent::Suggested {
+                    suggestion_id: suggestion.id,
+                    command: &suggestion.command,
+                    reason: suggestion.reason.as_deref(),
+                },
+            );
+        }
         (suggestion, immediate_notice)
     };
 
     if let Some(notice) = immediate_notice {
         let _ = state.notifier.write(notice.as_bytes());
     }
+    let suggestion = match &state.auto {
+        Some(auto) => {
+            let dispatched = auto.dispatch_next();
+            let (current, command_is_open) = {
+                let store = state.store.lock().unwrap();
+                (store.suggestion(suggestion.id), store.command_is_open())
+            };
+            let current = current.unwrap_or(suggestion);
+            // Behind a running command it simply runs at the next prompt;
+            // only a prompt the human is typing at needs the explanation.
+            if current.status == SuggestionStatus::Pending && !dispatched && !command_is_open {
+                let _ = state.notifier.write(
+                    format!(
+                        "\r\n\x1b[1;36m(witness) suggestion #{} queued — runs at your next empty prompt\x1b[0m\r\n",
+                        current.id
+                    )
+                    .as_bytes(),
+                );
+            }
+            current
+        }
+        None => suggestion,
+    };
     (StatusCode::CREATED, Json(suggestion)).into_response()
+}
+
+impl AppState {
+    fn audit_rejection(&self, command: &str, error: &str) {
+        if let Some(audit) = &self.audit {
+            // The body is unvalidated, so cap what goes on record.
+            let command: String = command.chars().take(1024).collect();
+            audit.record_or_warn(
+                &self.notifier,
+                &AuditEvent::SuggestionRejected {
+                    command: &command,
+                    error,
+                },
+            );
+        }
+    }
 }
 
 async fn suggestions(State(state): State<AppState>) -> Json<Vec<Suggestion>> {
@@ -210,7 +279,12 @@ async fn suggestions(State(state): State<AppState>) -> Json<Vec<Suggestion>> {
 async fn docs(State(state): State<AppState>) -> impl IntoResponse {
     (
         [(CONTENT_TYPE, "text/markdown; charset=utf-8")],
-        generate_docs(&state.public_host, state.port, &state.token),
+        generate_docs(
+            &state.public_host,
+            state.port,
+            &state.token,
+            state.auto.is_some(),
+        ),
     )
 }
 
@@ -313,16 +387,24 @@ fn default_tail_count() -> usize {
     20
 }
 
-fn generate_docs(host: &str, port: u16, token: &str) -> String {
+fn generate_docs(host: &str, port: u16, token: &str, auto_approve: bool) -> String {
     let base_url = format!("http://{host}:{port}");
     let mut docs = String::new();
     writeln!(docs, "# Witness human-controlled shell session API").unwrap();
     writeln!(docs).unwrap();
-    writeln!(
-        docs,
-        "This API is observational: you can inspect the commands the human runs, including each command's id, time, exit code, and captured output, but the API **CANNOT** execute anything. `POST /suggest` only queues inert proposal text; the human must physically insert it at their prompt with Ctrl-G, review it, and press Enter themselves."
-    )
-    .unwrap();
+    if auto_approve {
+        writeln!(
+            docs,
+            "You can inspect the commands run in the human's shell, including each command's id, time, exit code, and captured output. This session runs with **auto-approve**: every command you send to `POST /suggest` is **EXECUTED** in the human's shell without review, with their privileges, as soon as their prompt is idle. Treat each suggestion as a command you are running yourself: send only what the human asked for, avoid destructive or irreversible commands, and ask the human first when in doubt. Everything you send is written to an audit log."
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            docs,
+            "This API is observational: you can inspect the commands the human runs, including each command's id, time, exit code, and captured output, but the API **CANNOT** execute anything. `POST /suggest` only queues inert proposal text; the human must physically insert it at their prompt with Ctrl-G, review it, and press Enter themselves."
+        )
+        .unwrap();
+    }
     writeln!(docs).unwrap();
     writeln!(docs, "## Connection details").unwrap();
     writeln!(docs).unwrap();
@@ -400,7 +482,11 @@ fn generate_docs(host: &str, port: u16, token: &str) -> String {
     writeln!(docs).unwrap();
     writeln!(docs, "### `POST /suggest`").unwrap();
     writeln!(docs).unwrap();
-    writeln!(docs, "Queues one inert, single-line command proposal. A suggestion never executes automatically: the human sees a terminal notification and may press Ctrl-G at their prompt to insert the text, then edit and run it with Enter, discard it, or ignore it. Watch `/commands` (or `/status` `last_id`) to learn whether and how it ran. Keep suggestions non-interactive, include a short reason, and remember that at most 10 suggestions may be pending.").unwrap();
+    if auto_approve {
+        writeln!(docs, "Queues one single-line command that witness **runs automatically**: it is typed into the human's shell, followed by Enter, at the next idle prompt. Commands run one at a time in the order posted; one posted while another command is running, or while the human is typing, stays `pending` until a fresh prompt appears. The response shows the suggestion's status (`pending` or `auto_approved`). Watch `/commands` (or `/status` `last_id`) for the result. Keep commands non-interactive, include a short reason, and remember that at most 10 suggestions may be pending.").unwrap();
+    } else {
+        writeln!(docs, "Queues one inert, single-line command proposal. A suggestion never executes automatically: the human sees a terminal notification and may press Ctrl-G at their prompt to insert the text, then edit and run it with Enter, discard it, or ignore it. Watch `/commands` (or `/status` `last_id`) to learn whether and how it ran. Keep suggestions non-interactive, include a short reason, and remember that at most 10 suggestions may be pending.").unwrap();
+    }
     writeln!(docs).unwrap();
     writeln!(docs, "```sh").unwrap();
     writeln!(
@@ -412,7 +498,7 @@ fn generate_docs(host: &str, port: u16, token: &str) -> String {
     writeln!(docs).unwrap();
     writeln!(docs, "### `GET /suggestions`").unwrap();
     writeln!(docs).unwrap();
-    writeln!(docs, "Returns every suggestion from this session, oldest first, including whether each is `pending` or `inserted`.").unwrap();
+    writeln!(docs, "Returns every suggestion from this session, oldest first, including whether each is `pending`, `inserted`, or `auto_approved`.").unwrap();
     writeln!(docs).unwrap();
     writeln!(docs, "```sh").unwrap();
     writeln!(docs, "curl \"{base_url}/suggestions?token={token}\"").unwrap();
@@ -593,7 +679,8 @@ mod tests {
 
     #[test]
     fn docs_include_runtime_values_and_endpoints() {
-        let docs = generate_docs("shell.example.test", 43210, "fixed-session-token");
+        let docs = generate_docs("shell.example.test", 43210, "fixed-session-token", false);
+        assert!(docs.contains("**CANNOT** execute"));
         for expected in [
             "fixed-session-token",
             "shell.example.test",
@@ -608,6 +695,14 @@ mod tests {
         ] {
             assert!(docs.contains(expected), "docs missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn auto_approve_docs_warn_that_suggestions_execute() {
+        let docs = generate_docs("shell.example.test", 43210, "fixed-session-token", true);
+        assert!(docs.contains("**EXECUTED**"));
+        assert!(!docs.contains("CANNOT"));
+        assert!(!docs.contains("never executes automatically"));
     }
 
     #[test]

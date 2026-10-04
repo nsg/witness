@@ -14,10 +14,11 @@ pub struct Status {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SuggestionStatus {
     Pending,
     Inserted,
+    AutoApproved,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -64,6 +65,8 @@ pub struct Store {
     suggestions: Vec<Suggestion>,
     next_suggestion_id: u64,
     pending_notices: Vec<String>,
+    prompt_idle: bool,
+    unsubmitted_input: bool,
     max_commands: usize,
     max_output_bytes: usize,
 }
@@ -77,13 +80,16 @@ impl Store {
             suggestions: Vec::new(),
             next_suggestion_id: 1,
             pending_notices: Vec::new(),
+            prompt_idle: false,
+            unsubmitted_input: false,
             max_commands,
             max_output_bytes,
         }
     }
 
-    pub fn begin(&mut self, command: String) {
+    pub fn begin(&mut self, command: String) -> u64 {
         self.finish_open(None);
+        self.prompt_idle = false;
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.open = Some(OpenCommand {
@@ -93,6 +99,7 @@ impl Store {
             output: Vec::new(),
             truncated: false,
         });
+        id
     }
 
     pub fn append_output(&mut self, bytes: &[u8]) {
@@ -107,16 +114,10 @@ impl Store {
         }
     }
 
-    pub fn end(&mut self, code: i32) {
-        if self.open.is_some() {
-            self.finish_open(Some(code));
-        }
-    }
-
-    pub fn finish_open(&mut self, exit_code: Option<i32>) {
-        let Some(open) = self.open.take() else {
-            return;
-        };
+    /// Closes the running command, returning its id if there was one.
+    pub fn finish_open(&mut self, exit_code: Option<i32>) -> Option<u64> {
+        let open = self.open.take()?;
+        let id = open.id;
         let record = CommandRecord {
             id: open.id,
             command: open.command,
@@ -128,6 +129,34 @@ impl Store {
             running: false,
         };
         self.push(record);
+        Some(id)
+    }
+
+    /// A fresh shell prompt is waiting and nothing has been typed at it yet.
+    /// A command may still be open: the prompt of a shell nested inside
+    /// `sudo`, `su`, or `witness ssh` appears while that command runs.
+    pub fn prompt_idle(&self) -> bool {
+        self.prompt_idle
+    }
+
+    /// The shell printed a prompt. It only counts as idle when the human has
+    /// no keystrokes outstanding, e.g. typed ahead while a command ran.
+    pub fn prompt_shown(&mut self) {
+        self.prompt_idle = !self.unsubmitted_input;
+    }
+
+    pub fn prompt_taken(&mut self) {
+        self.prompt_idle = false;
+    }
+
+    /// Human keystrokes make the prompt theirs. Input ending in Enter or
+    /// Ctrl-C leaves nothing behind on the line, so the next prompt is fresh.
+    pub fn note_input(&mut self, bytes: &[u8]) {
+        let Some(last) = bytes.last() else {
+            return;
+        };
+        self.prompt_idle = false;
+        self.unsubmitted_input = !matches!(last, b'\r' | b'\n' | 0x03);
     }
 
     pub fn commands_since(&self, since: u64) -> Vec<CommandRecord> {
@@ -184,7 +213,8 @@ impl Store {
         Ok(suggestion)
     }
 
-    pub fn pop_pending_suggestion(&mut self) -> Option<Suggestion> {
+    /// Oldest pending suggestion, left in the queue until it is resolved.
+    pub fn next_pending_suggestion(&mut self) -> Option<Suggestion> {
         loop {
             let index = self
                 .suggestions
@@ -194,11 +224,30 @@ impl Store {
                 self.suggestions.remove(index);
                 continue;
             }
-            let suggestion = &mut self.suggestions[index];
-            suggestion.status = SuggestionStatus::Inserted;
-            suggestion.inserted_at = Some(now());
-            return Some(suggestion.clone());
+            return Some(self.suggestions[index].clone());
         }
+    }
+
+    pub fn resolve_suggestion(&mut self, id: u64, status: SuggestionStatus) -> Option<Suggestion> {
+        let suggestion = self
+            .suggestions
+            .iter_mut()
+            .find(|suggestion| suggestion.id == id)?;
+        suggestion.status = status;
+        suggestion.inserted_at = Some(now());
+        Some(suggestion.clone())
+    }
+
+    pub fn pop_pending_suggestion(&mut self) -> Option<Suggestion> {
+        let id = self.next_pending_suggestion()?.id;
+        self.resolve_suggestion(id, SuggestionStatus::Inserted)
+    }
+
+    pub fn suggestion(&self, id: u64) -> Option<Suggestion> {
+        self.suggestions
+            .iter()
+            .find(|suggestion| suggestion.id == id)
+            .cloned()
     }
 
     pub fn suggestions(&self) -> Vec<Suggestion> {
@@ -389,5 +438,29 @@ mod tests {
         assert_eq!(store.status().pending_suggestions, 2);
         store.pop_pending_suggestion();
         assert_eq!(store.status().pending_suggestions, 1);
+    }
+
+    #[test]
+    fn starting_a_command_ends_the_idle_prompt() {
+        let mut store = Store::new(10, 1024);
+        assert!(!store.prompt_idle());
+        store.prompt_shown();
+        store.begin("sleep 1".into());
+        assert!(!store.prompt_idle());
+        store.finish_open(Some(0));
+        assert!(!store.prompt_idle(), "idle again only at the next prompt");
+    }
+
+    #[test]
+    fn typed_ahead_input_keeps_the_next_prompt_busy() {
+        let mut store = Store::new(10, 1024);
+        store.note_input(b"rm -rf x");
+        store.prompt_shown();
+        assert!(!store.prompt_idle(), "half-typed line is waiting");
+        store.note_input(b"\r");
+        store.prompt_shown();
+        assert!(store.prompt_idle());
+        store.note_input(b"l");
+        assert!(!store.prompt_idle());
     }
 }

@@ -12,6 +12,7 @@ const ALT_SEQUENCES: &[(&[u8], bool)] = &[
 pub enum ParseEvent {
     Begin(String),
     End(i32),
+    Prompt,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -128,6 +129,8 @@ impl MarkerParser {
                 .parse::<i32>()
                 .ok()
                 .map(ParseEvent::End)
+        } else if payload == b"P" {
+            Some(ParseEvent::Prompt)
         } else {
             None
         };
@@ -223,8 +226,13 @@ mod tests {
             match action {
                 StreamAction::Output(bytes, true) => store.append_output(&bytes),
                 StreamAction::Output(_, false) => {}
-                StreamAction::Event(ParseEvent::Begin(command)) => store.begin(command),
-                StreamAction::Event(ParseEvent::End(code)) => store.end(code),
+                StreamAction::Event(ParseEvent::Begin(command)) => {
+                    store.begin(command);
+                }
+                StreamAction::Event(ParseEvent::End(code)) => {
+                    store.finish_open(Some(code));
+                }
+                StreamAction::Event(ParseEvent::Prompt) => store.prompt_shown(),
             }
         }
     }
@@ -259,6 +267,13 @@ mod tests {
         let result = MarkerParser::new().feed(b"done\r\n\x1b]1337;witness;E;0\x07");
         assert_eq!(result.cleaned, b"done\r\n");
         assert_eq!(result.events, [ParseEvent::End(0)]);
+    }
+
+    #[test]
+    fn prompt_marker_is_stripped() {
+        let result = MarkerParser::new().feed(b"\x1b]1337;witness;P\x07$ ");
+        assert_eq!(result.cleaned, b"$ ");
+        assert_eq!(result.events, [ParseEvent::Prompt]);
     }
 
     #[test]

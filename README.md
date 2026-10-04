@@ -16,7 +16,8 @@ human-approved suggestions.
 The point is collaborative troubleshooting: start `witness`, hand the printed URL to an
 external agent, and it can "look at your screen" — observing the commands you run and their
 output to help you debug — without ever being able to execute anything. An agent may queue inert
-command text, but only your local Ctrl-G can insert it and only your Enter can run it.
+command text, but only your local Ctrl-G can insert it and only your Enter can run it
+(unless you opt in to [auto-approve](#auto-approve)).
 
 Your shell behaves exactly as normal. Full-screen apps (`vim`, `less`, `htop`, `fzf`) work
 untouched, and their alternate-screen output is intentionally left out of the record.
@@ -28,6 +29,8 @@ untouched, and their alternate-screen output is intentionally left out of the re
 - Observational REST API with bearer-token auth (header **or** `?token=` query param).
 - Agent can *suggest* commands (`POST /suggest`) — you review them at your prompt with Ctrl-G
   and decide; nothing ever executes without your Enter. Works over SSH and sudo too.
+- Opt-in `--auto-approve` runs suggestions without the Ctrl-G step, and a JSON Lines audit log
+  records every command and suggestion.
 - Auto-selected free port and `0.0.0.0` bind, so multiple sessions run side by side.
 - Self-documenting: `GET /docs.md?token=…` returns a dynamic guide for the agent.
 - `strip_ansi=true` for clean, plain-text output.
@@ -85,9 +88,9 @@ All endpoints return JSON (except `/docs.md`, which returns Markdown). Every end
 | `GET /tail?n=<count>` | yes | The last `n` completed records (default `20`), newest last. |
 | `GET /status` | yes | Tiny polling payload: newest command id, its time, `age_seconds`, `running`, `count`, `pending_suggestions`. |
 | `POST /suggest` | yes | Queue inert command text for human review; at most 10 may be pending. |
-| `GET /suggestions` | yes | All session suggestions, oldest first, with pending/inserted status. |
+| `GET /suggestions` | yes | All session suggestions, oldest first, with `pending`/`inserted`/`auto_approved` status. |
 
-Suggestions never execute automatically. After an agent posts one, witness displays a local
+By default, suggestions never execute automatically. After an agent posts one, witness displays a local
 notification; at your prompt, Ctrl-G inserts its sanitized text without a newline. You can edit
 it, press Enter to run it, discard it, or ignore it. Because insertion happens in the local PTY
 input path, the same flow works in shells reached through `witness ssh`, `sudo`, or `su`.
@@ -113,6 +116,46 @@ A record looks like:
 }
 ```
 
+## Auto-approve
+
+`witness run --auto-approve` (or `witness ssh --auto-approve <host>`) drops the Ctrl-G step: witness types each suggestion into your
+shell, followed by Enter, on its own. It is off by default.
+
+> [!WARNING]
+> With `--auto-approve`, anyone holding the session token can run commands as you. The API is
+> plain HTTP and binds to `0.0.0.0` by default, so keep it on a network you trust or bind it
+> with `--addr 127.0.0.1:0`.
+
+Suggestions run one at a time, in the order posted, and only at a fresh prompt you have not
+typed at. One that arrives while a command is running, or while you are typing, waits for the
+next prompt — press Enter on an empty line to release it, or Ctrl-G to insert it yourself.
+Wherever your prompt is, that is where the command runs, including shells reached through
+`witness ssh`, `sudo`, or `su`.
+
+## Audit log
+
+With `--auto-approve`, or whenever `--audit-log <path>` is given, witness appends one JSON
+object per line to an audit log (created with mode `0600`):
+
+| Event | Meaning |
+|-------|---------|
+| `session_started` | A session opened; records whether auto-approve is on. |
+| `suggested` | An agent posted a suggestion. |
+| `suggestion_rejected` | A suggestion was refused (invalid, or the queue was full). |
+| `inserted` | You inserted a suggestion with Ctrl-G. |
+| `auto_approved` | Witness sent a suggestion to the shell on its own. |
+| `command_started` | The shell started a command, whoever typed it. |
+| `command_finished` | That command ended, with its exit code. |
+
+```json
+{"at":"2026-10-04T07:29:14.760795147Z","session":37914,"event":"auto_approved","suggestion_id":1,"command":"systemctl status nginx","reason":"check if it is running"}
+```
+
+Every entry carries a timestamp and the witness process id as `session`, so sessions can share
+one file. The default location is `$XDG_STATE_HOME/witness/audit.log`, falling back to
+`~/.local/state/witness/audit.log`. An auto-approved command is logged before it is sent; if
+that write fails, the command is not run.
+
 ## SSH
 
 To let the agent see commands you run on a remote host, connect with:
@@ -127,6 +170,10 @@ This works two ways:
   connection. Remote commands are tagged and served through the API.
 - **Nested** — run from inside an existing `witness run` session, it folds remote commands into
   the same timeline as your local ones, with no second server.
+
+A standalone `witness ssh` also accepts `--auto-approve` and `--audit-log <path>`; put them
+before the host, since everything from the first ssh argument on is passed to ssh. Nested, the
+outer `witness run` session decides and the flags are ignored.
 
 Only a small hook that prints marker escape sequences is injected into the remote shell; those
 markers ride back over the SSH connection and are parsed locally. Nothing is installed on the
@@ -144,6 +191,8 @@ remote. The remote host needs `bash`, `mktemp`, and `base64`.
 | `--token <token>` | `$WITNESS_TOKEN` or random | Bearer token for this session. |
 | `--max-commands <n>` | `10000` | Retained command records (ring buffer). |
 | `--max-output-bytes <n>` | `1048576` | Captured output cap per command; extra is truncated. |
+| `--auto-approve` | off | Run agent suggestions without waiting for Ctrl-G. |
+| `--audit-log <path>` | off, or the default path with `--auto-approve` | Append every command and suggestion to this file. |
 
 The token is valid only for the running session; each session picks its own port. `witness
 token` prints a fresh random token.
