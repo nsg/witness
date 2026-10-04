@@ -116,6 +116,8 @@ pub fn spawn_command(
     command
         .args(&argv[1..])
         .envs(env.iter().map(|(name, value)| (name, value)))
+        // The relay key must not be readable from inside the recorded shell.
+        .env_remove("WITNESS_RELAY_KEY")
         .stdin(Stdio::from(slave))
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));

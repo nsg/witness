@@ -1,9 +1,12 @@
 mod api;
 mod audit;
 mod auto;
+mod connect;
 mod parser;
 mod pty;
+mod relay;
 mod store;
+mod tunnel;
 
 use std::{
     ffi::OsString,
@@ -38,18 +41,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Wrap an interactive shell and serve the read-only API
+    /// Wrap a shell on the session host and serve the read-only API
     Run(RunArgs),
-    /// Open an SSH session with witness hooks installed on the remote shell
+    /// Open SSH from the session host with witness hooks on the remote shell
     Ssh {
         #[command(flatten)]
-        approval: ApprovalArgs,
+        session: SessionArgs,
         /// Arguments passed through to ssh (host and any ssh options)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         args: Vec<String>,
     },
+    /// Run an untrusted WebSocket relay
+    Serve {
+        /// Address to bind the relay to
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        addr: SocketAddr,
+    },
+    /// On the agent host, expose a relayed session on a local HTTP API
+    Connect(ConnectArgs),
     /// Print a fresh random bearer token and exit
     Token,
+    /// Print a fresh relay key and exit
+    Key,
 }
 
 #[derive(Args)]
@@ -58,8 +71,8 @@ struct RunArgs {
     #[arg(long, default_value = "/bin/bash")]
     shell: PathBuf,
     /// Address to bind the API to (host:port; port 0 picks a free port)
-    #[arg(long, default_value = "0.0.0.0:0")]
-    addr: SocketAddr,
+    #[arg(long)]
+    addr: Option<SocketAddr>,
     /// Hostname to advertise in the banner and docs (defaults to the machine's FQDN/IP)
     #[arg(long)]
     public_host: Option<String>,
@@ -73,11 +86,11 @@ struct RunArgs {
     #[arg(long, default_value_t = 1_048_576)]
     max_output_bytes: usize,
     #[command(flatten)]
-    approval: ApprovalArgs,
+    session: SessionArgs,
 }
 
 #[derive(Args)]
-struct ApprovalArgs {
+struct SessionArgs {
     /// Run agent suggestions as soon as the prompt is idle instead of waiting
     /// for Ctrl-G. DANGEROUS: anyone holding the token can execute commands
     #[arg(long)]
@@ -87,16 +100,39 @@ struct ApprovalArgs {
     /// $XDG_STATE_HOME/witness/audit.log)
     #[arg(long)]
     audit_log: Option<PathBuf>,
+    /// Relay URL reachable by both the session host and agent host
+    #[arg(long)]
+    relay: Option<String>,
+    /// Read the relay key from this file (preferred over WITNESS_RELAY_KEY)
+    #[arg(long)]
+    relay_key_file: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ConnectArgs {
+    /// Relay URL used by the session host
+    relay_url: String,
+    /// Address for the local API
+    #[arg(long, default_value = "127.0.0.1:0")]
+    addr: SocketAddr,
+    /// Local bearer token (defaults to $WITNESS_TOKEN, else a random one)
+    #[arg(long)]
+    token: Option<String>,
+    /// Read the relay key from this file (preferred over WITNESS_RELAY_KEY)
+    #[arg(long)]
+    relay_key_file: Option<PathBuf>,
 }
 
 struct Config {
-    addr: SocketAddr,
+    addr: Option<SocketAddr>,
     public_host: Option<String>,
     token: Option<String>,
     max_commands: usize,
     max_output_bytes: usize,
     auto_approve: bool,
     audit_log: Option<PathBuf>,
+    relay: Option<String>,
+    relay_key_file: Option<PathBuf>,
 }
 
 /// Handles shared by the PTY reader, the stdin copier, and the API.
@@ -119,13 +155,15 @@ impl Session {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            addr: None,
             public_host: None,
             token: None,
             max_commands: 10_000,
             max_output_bytes: 1_048_576,
             auto_approve: false,
             audit_log: None,
+            relay: None,
+            relay_key_file: None,
         }
     }
 }
@@ -138,8 +176,10 @@ impl From<&RunArgs> for Config {
             token: args.token.clone(),
             max_commands: args.max_commands,
             max_output_bytes: args.max_output_bytes,
-            auto_approve: args.approval.auto_approve,
-            audit_log: args.approval.audit_log.clone(),
+            auto_approve: args.session.auto_approve,
+            audit_log: args.session.audit_log.clone(),
+            relay: args.session.relay.clone(),
+            relay_key_file: args.session.relay_key_file.clone(),
         }
     }
 }
@@ -151,6 +191,26 @@ async fn main() -> ExitCode {
             println!("{}", generate_token());
             ExitCode::SUCCESS
         }
+        Command::Key => {
+            println!("{}", tunnel::RelayKey::generate());
+            ExitCode::SUCCESS
+        }
+        Command::Serve { addr } => match relay::serve(addr).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("witness: {error:#}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Connect(args) => {
+            match connect::run(args.relay_url, args.addr, args.token, args.relay_key_file).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("witness: {error:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Run(args) => match run(args).await {
             Ok(code) => ExitCode::from(code),
             Err(error) => {
@@ -158,7 +218,7 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Ssh { approval, args } => match ssh(approval, args).await {
+        Command::Ssh { session, args } => match ssh(session, args).await {
             Ok(code) => ExitCode::from(code),
             Err(error) => {
                 eprintln!("witness: {error:#}");
@@ -187,12 +247,16 @@ async fn run(args: RunArgs) -> Result<u8> {
     run_session(&child_argv, &session_child_env(), &Config::from(&args)).await
 }
 
-async fn ssh(approval: ApprovalArgs, args: Vec<String>) -> Result<u8> {
+async fn ssh(session: SessionArgs, args: Vec<String>) -> Result<u8> {
     let child_argv = ssh_argv(args);
     if std::env::var_os("WITNESS_SESSION").is_some() {
-        if approval.auto_approve || approval.audit_log.is_some() {
+        if session.auto_approve
+            || session.audit_log.is_some()
+            || session.relay.is_some()
+            || session.relay_key_file.is_some()
+        {
             eprintln!(
-                "witness: already inside a session; --auto-approve and --audit-log are set by the outer `witness run` and ignored here"
+                "witness: already inside a session; --auto-approve, --audit-log, --relay, and --relay-key-file are set by the outer `witness run` and ignored here"
             );
         }
         let error = ProcessCommand::new(&child_argv[0])
@@ -201,8 +265,10 @@ async fn ssh(approval: ApprovalArgs, args: Vec<String>) -> Result<u8> {
         return Err(error).context("failed to exec ssh");
     }
     let cfg = Config {
-        auto_approve: approval.auto_approve,
-        audit_log: approval.audit_log,
+        auto_approve: session.auto_approve,
+        audit_log: session.audit_log,
+        relay: session.relay,
+        relay_key_file: session.relay_key_file,
         ..Config::default()
     };
     run_session(&child_argv, &session_child_env(), &cfg).await
@@ -213,12 +279,20 @@ async fn run_session(
     child_env: &[(String, String)],
     cfg: &Config,
 ) -> Result<u8> {
+    let relay = match cfg.relay.as_deref() {
+        Some(url) => {
+            let (key, supplied) = tunnel::session_key(cfg.relay_key_file.as_deref())?;
+            tunnel::relay_url(url, &key, tunnel::Role::Session)?;
+            Some((url.to_owned(), key, supplied))
+        }
+        None => None,
+    };
     let token = cfg
         .token
         .clone()
         .or_else(|| std::env::var("WITNESS_TOKEN").ok())
         .unwrap_or_else(generate_token);
-    let public_host = cfg.public_host.clone().unwrap_or_else(resolve_public_host);
+
     let store = Arc::new(Mutex::new(Store::new(
         cfg.max_commands,
         cfg.max_output_bytes,
@@ -241,8 +315,23 @@ async fn run_session(
             })
             .with_context(|| format!("failed to write audit log {}", audit.path().display()))?;
     }
-    let listener = TcpListener::bind(cfg.addr)
-        .with_context(|| format!("failed to bind HTTP API to {}", cfg.addr))?;
+    let bind_addr = cfg.addr.unwrap_or_else(|| {
+        if relay.is_some() {
+            SocketAddr::from(([127, 0, 0, 1], 0))
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        }
+    });
+    let listener = TcpListener::bind(bind_addr)
+        .with_context(|| format!("failed to bind HTTP API to {bind_addr}"))?;
+    // A loopback-only API is not reachable under the machine's public name.
+    let public_host = cfg.public_host.clone().unwrap_or_else(|| {
+        if bind_addr.ip().is_loopback() {
+            bind_addr.ip().to_string()
+        } else {
+            resolve_public_host()
+        }
+    });
     let local_addr = listener
         .local_addr()
         .context("failed to read bound HTTP API address")?;
@@ -268,6 +357,17 @@ async fn run_session(
     eprintln!("witness: token  {token}");
     if let Some(audit) = &audit {
         eprintln!("witness: audit  {}", audit.path().display());
+    }
+    if let Some((url, key, supplied)) = &relay {
+        eprintln!("witness: relay  {url}");
+        if *supplied {
+            eprintln!("witness: key    (supplied)");
+        } else {
+            eprintln!("witness: key    {key}");
+        }
+        eprintln!("witness:");
+        eprintln!("witness: on the agent host run, then enter the key when asked:");
+        eprintln!("witness:   witness connect {url}");
     }
     eprintln!("witness:");
     eprintln!("witness: give your agent this URL and say \"read this\":");
@@ -302,6 +402,16 @@ async fn run_session(
         auto,
     };
 
+    let tunnel_task = relay.map(|(url, key, _)| {
+        let app = api::tunnel_router(
+            Arc::clone(&session.store),
+            session.notifier.clone(),
+            session.audit.clone(),
+            session.auto.clone(),
+        );
+        tunnel::spawn_session(url, key, app)
+    });
+
     let reader_session = session.clone();
     let (reader_tx, reader_rx) = oneshot::channel();
     let _reader_thread = thread::spawn(move || {
@@ -335,6 +445,9 @@ async fn run_session(
 
     let _ = shutdown_tx.send(());
     resize_task.abort();
+    if let Some(task) = tunnel_task {
+        task.abort();
+    }
     match tokio::time::timeout(Duration::from_secs(2), reader_rx).await {
         Ok(Ok(result)) => result?,
         Ok(Err(_)) => anyhow::bail!("PTY reader thread stopped unexpectedly"),
@@ -685,7 +798,7 @@ fn spawn_resize_task(master: std::fs::File) -> tokio::task::JoinHandle<()> {
     })
 }
 
-fn generate_token() -> String {
+pub(crate) fn generate_token() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     let mut token = String::with_capacity(64);
@@ -887,18 +1000,28 @@ mod tests {
     #[test]
     fn ssh_takes_witness_flags_before_the_host_and_passes_the_rest_through() {
         let cli = Cli::parse_from(["witness", "ssh", "--auto-approve", "-p", "2222", "host"]);
-        let Command::Ssh { approval, args } = cli.command else {
+        let Command::Ssh { session, args } = cli.command else {
             panic!("expected ssh");
         };
-        assert!(approval.auto_approve);
+        assert!(session.auto_approve);
         assert_eq!(args, ["-p", "2222", "host"]);
 
         let cli = Cli::parse_from(["witness", "ssh", "host", "--auto-approve"]);
-        let Command::Ssh { approval, args } = cli.command else {
+        let Command::Ssh { session, args } = cli.command else {
             panic!("expected ssh");
         };
-        assert!(!approval.auto_approve);
+        assert!(!session.auto_approve);
         assert_eq!(args, ["host", "--auto-approve"]);
+    }
+
+    #[test]
+    fn ssh_takes_relay_before_host_without_consuming_host() {
+        let cli = Cli::parse_from(["witness", "ssh", "--relay", "https://r.example", "host"]);
+        let Command::Ssh { session, args } = cli.command else {
+            panic!("expected ssh");
+        };
+        assert_eq!(session.relay.as_deref(), Some("https://r.example"));
+        assert_eq!(args, ["host"]);
     }
 
     #[test]

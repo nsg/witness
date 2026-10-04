@@ -50,9 +50,15 @@ struct AppState {
     notifier: Notifier,
     audit: Option<Arc<AuditLog>>,
     auto: Option<Arc<AutoApprover>>,
-    public_host: Arc<str>,
-    port: u16,
+    docs_source: DocsSource,
     token: Arc<str>,
+    via: &'static str,
+}
+
+#[derive(Clone)]
+enum DocsSource {
+    Direct(Arc<str>),
+    Request,
 }
 
 #[derive(Deserialize)]
@@ -101,33 +107,60 @@ pub fn router(
     public_host: String,
     port: u16,
 ) -> Router {
-    let token: Arc<str> = Arc::from(token);
-    let protected = Router::new()
+    let base_url = format!("http://{public_host}:{port}");
+    build_router(
+        AppState {
+            store,
+            notifier,
+            audit,
+            auto,
+            docs_source: DocsSource::Direct(Arc::from(base_url)),
+            token: Arc::from(token),
+            via: "direct",
+        },
+        true,
+    )
+}
+
+pub fn tunnel_router(
+    store: Arc<Mutex<Store>>,
+    notifier: Notifier,
+    audit: Option<Arc<AuditLog>>,
+    auto: Option<Arc<AutoApprover>>,
+) -> Router {
+    build_router(
+        AppState {
+            store,
+            notifier,
+            audit,
+            auto,
+            docs_source: DocsSource::Request,
+            token: Arc::from(""),
+            via: "relay",
+        },
+        false,
+    )
+}
+
+fn build_router(state: AppState, require_token: bool) -> Router {
+    let token = Arc::clone(&state.token);
+    let mut protected = Router::new()
         .route("/commands", get(commands))
         .route("/commands/{id}", get(command))
         .route("/tail", get(tail))
         .route("/status", get(status))
         .route("/suggest", post(suggest))
         .route("/suggestions", get(suggestions))
-        .route("/docs.md", get(docs))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::clone(&token),
-            require_auth,
-        ));
+        .route("/docs.md", get(docs));
+    if require_token {
+        protected = protected.route_layer(middleware::from_fn_with_state(token, require_auth));
+    }
     Router::new()
         .route("/health", get(health))
         .merge(protected)
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
-        .with_state(AppState {
-            store,
-            notifier,
-            audit,
-            auto,
-            public_host: Arc::from(public_host),
-            port,
-            token,
-        })
+        .with_state(state)
 }
 
 async fn health() -> Json<Health> {
@@ -221,6 +254,7 @@ async fn suggest(State(state): State<AppState>, Json(body): Json<SuggestBody>) -
                     suggestion_id: suggestion.id,
                     command: &suggestion.command,
                     reason: suggestion.reason.as_deref(),
+                    via: state.via,
                 },
             );
         }
@@ -266,6 +300,7 @@ impl AppState {
                 &AuditEvent::SuggestionRejected {
                     command: &command,
                     error,
+                    via: self.via,
                 },
             );
         }
@@ -276,19 +311,36 @@ async fn suggestions(State(state): State<AppState>) -> Json<Vec<Suggestion>> {
     Json(state.store.lock().unwrap().suggestions())
 }
 
-async fn docs(State(state): State<AppState>) -> impl IntoResponse {
+async fn docs(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> impl IntoResponse {
+    let (base_url, token) = match &state.docs_source {
+        DocsSource::Direct(base_url) => (base_url.to_string(), state.token.to_string()),
+        DocsSource::Request => {
+            let host = headers
+                .get(axum::http::header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("127.0.0.1");
+            let query_token = Query::<AuthQuery>::try_from_uri(&uri)
+                .ok()
+                .and_then(|Query(query)| query.token);
+            let header_token = headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "));
+            (
+                format!("http://{host}"),
+                query_token
+                    .or_else(|| header_token.map(str::to_owned))
+                    .unwrap_or_default(),
+            )
+        }
+    };
     (
         [(CONTENT_TYPE, "text/markdown; charset=utf-8")],
-        generate_docs(
-            &state.public_host,
-            state.port,
-            &state.token,
-            state.auto.is_some(),
-        ),
+        generate_docs(&base_url, &token, state.auto.is_some()),
     )
 }
 
-fn authorized(headers: &HeaderMap, query_token: Option<&str>, expected: &str) -> bool {
+pub fn authorized(headers: &HeaderMap, query_token: Option<&str>, expected: &str) -> bool {
     let header_authorized = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -299,13 +351,21 @@ fn authorized(headers: &HeaderMap, query_token: Option<&str>, expected: &str) ->
     header_authorized | query_authorized
 }
 
-fn unauthorized() -> (StatusCode, Json<ErrorBody>) {
+pub fn request_authorized(headers: &HeaderMap, uri: &Uri, expected: &str) -> bool {
+    let query_token = Query::<AuthQuery>::try_from_uri(uri)
+        .ok()
+        .and_then(|Query(query)| query.token);
+    authorized(headers, query_token.as_deref(), expected)
+}
+
+pub fn unauthorized() -> Response {
     (
         StatusCode::UNAUTHORIZED,
         Json(ErrorBody {
             error: "unauthorized",
         }),
     )
+        .into_response()
 }
 
 fn bad_request(error: &'static str) -> (StatusCode, Json<ErrorBody>) {
@@ -365,13 +425,10 @@ async fn method_not_allowed() -> (StatusCode, Json<ErrorBody>) {
 }
 
 async fn require_auth(State(expected): State<Arc<str>>, request: Request, next: Next) -> Response {
-    let query_token = Query::<AuthQuery>::try_from_uri(request.uri())
-        .ok()
-        .and_then(|Query(query)| query.token);
-    if authorized(request.headers(), query_token.as_deref(), &expected) {
+    if request_authorized(request.headers(), request.uri(), &expected) {
         next.run(request).await
     } else {
-        unauthorized().into_response()
+        unauthorized()
     }
 }
 
@@ -387,8 +444,8 @@ fn default_tail_count() -> usize {
     20
 }
 
-fn generate_docs(host: &str, port: u16, token: &str, auto_approve: bool) -> String {
-    let base_url = format!("http://{host}:{port}");
+fn generate_docs(base_url: &str, token: &str, auto_approve: bool) -> String {
+    let port = base_url.rsplit(':').next().unwrap_or("");
     let mut docs = String::new();
     writeln!(docs, "# Witness human-controlled shell session API").unwrap();
     writeln!(docs).unwrap();
@@ -679,7 +736,11 @@ mod tests {
 
     #[test]
     fn docs_include_runtime_values_and_endpoints() {
-        let docs = generate_docs("shell.example.test", 43210, "fixed-session-token", false);
+        let docs = generate_docs(
+            "http://shell.example.test:43210",
+            "fixed-session-token",
+            false,
+        );
         assert!(docs.contains("**CANNOT** execute"));
         for expected in [
             "fixed-session-token",
@@ -699,7 +760,11 @@ mod tests {
 
     #[test]
     fn auto_approve_docs_warn_that_suggestions_execute() {
-        let docs = generate_docs("shell.example.test", 43210, "fixed-session-token", true);
+        let docs = generate_docs(
+            "http://shell.example.test:43210",
+            "fixed-session-token",
+            true,
+        );
         assert!(docs.contains("**EXECUTED**"));
         assert!(!docs.contains("CANNOT"));
         assert!(!docs.contains("never executes automatically"));

@@ -36,6 +36,8 @@ untouched, and their alternate-screen output is intentionally left out of the re
 - `strip_ansi=true` for clean, plain-text output.
 - `witness ssh <host>` extends tagging to a remote shell — remote commands appear in the
   same timeline. Only a small marker-printing hook is injected; nothing is installed remotely.
+- End-to-end encrypted relay mode connects session and agent hosts that cannot reach each other
+  directly, without trusting the relay with API traffic.
 - A colored `(witness)` prompt prefix so you always know a session is being recorded.
 - Tagging survives privilege changes — `sudo -i`, `sudo -s`, `su`, and nested shells stay
   recorded (witness transparently re-installs the hook in the new shell).
@@ -147,6 +149,9 @@ object per line to an audit log (created with mode `0600`):
 | `command_started` | The shell started a command, whoever typed it. |
 | `command_finished` | That command ended, with its exit code. |
 
+The `suggested` and `suggestion_rejected` events include `"via":"direct"` or
+`"via":"relay"`.
+
 ```json
 {"at":"2026-10-04T07:29:14.760795147Z","session":37914,"event":"auto_approved","suggestion_id":1,"command":"systemctl status nginx","reason":"check if it is running"}
 ```
@@ -171,13 +176,77 @@ This works two ways:
 - **Nested** — run from inside an existing `witness run` session, it folds remote commands into
   the same timeline as your local ones, with no second server.
 
-A standalone `witness ssh` also accepts `--auto-approve` and `--audit-log <path>`; put them
-before the host, since everything from the first ssh argument on is passed to ssh. Nested, the
-outer `witness run` session decides and the flags are ignored.
+A standalone `witness ssh` also accepts `--auto-approve`, `--audit-log <path>`,
+`--relay <url>`, and `--relay-key-file <path>`; put them before the host, since everything from
+the first ssh argument on is passed to ssh. Nested, the outer `witness run` session decides and
+the flags are ignored.
 
 Only a small hook that prints marker escape sequences is injected into the remote shell; those
 markers ride back over the SSH connection and are parsed locally. Nothing is installed on the
 remote. The remote host needs `bash`, `mktemp`, and `base64`.
+
+## Relay
+
+Relay mode connects hosts that cannot reach each other directly. It has three pieces:
+
+- The **session host** runs `witness run` or `witness ssh`; this is where the observed shell runs.
+- The **agent host** runs `witness connect`, which exposes the normal witness API on a local
+  `127.0.0.1` port. The agent continues to use ordinary HTTP and `curl` exactly as it does for a
+  direct session.
+- The **relay** runs `witness serve` on a third machine that both hosts can reach outbound over
+  HTTPS. It pairs their WebSocket connections and forwards encrypted messages without inspecting
+  them.
+
+The relay is untrusted. It sees the channel id, source IP addresses, connection timing, and
+encrypted message sizes, and it can drop or delay traffic. It cannot read or forge traffic, and
+replayed traffic is rejected. Encryption and authentication are end to end between the session
+host and agent host using a pre-shared key known only to those two hosts.
+
+Run the relay behind a TLS-terminating reverse proxy. `witness serve` itself provides plain HTTP
+and WebSocket service; the examples assume the proxy exposes it as `https://relay.example`.
+
+On the relay:
+
+```bash
+witness serve --addr 127.0.0.1:8080
+```
+
+On the session host:
+
+```bash
+witness run --relay https://relay.example
+```
+
+With no supplied key, the session host generates one and prints it in the startup banner. Copy
+that key securely to the agent host.
+
+On the agent host, connect and enter the key at the hidden prompt:
+
+```bash
+witness connect https://relay.example
+```
+
+The connect banner prints a local `/docs.md?token=...` URL to give to the agent. Keep
+`witness connect` running while the agent uses that URL.
+
+Relay keys have the form `wk1_<32 lowercase hex chars>_<64 lowercase hex chars>`. Generate one
+ahead of time with `witness key`. On both the session host and agent host, key sources are checked
+in this order:
+`--relay-key-file <path>` (trimmed file contents), then `WITNESS_RELAY_KEY`. There is deliberately
+no command-line key flag because command arguments are visible in the process list. When neither
+source is present, the session host generates and prints a key; `witness connect` prompts with
+echo disabled, or fails on non-interactive stdin with instructions to use one of the two sources.
+
+For example, to use the same key file on both hosts:
+
+```bash
+witness key > relay.key
+witness run --relay https://relay.example --relay-key-file relay.key
+```
+
+```bash
+witness connect https://relay.example --relay-key-file relay.key
+```
 
 ## Configuration
 
@@ -186,13 +255,30 @@ remote. The remote host needs `bash`, `mktemp`, and `base64`.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--shell <path>` | `/bin/bash` | Shell to wrap (bash hooks). |
-| `--addr <host:port>` | `0.0.0.0:0` | API bind address; port `0` picks a free port. |
+| `--addr <host:port>` | `0.0.0.0:0` | API bind address; port `0` picks a free port. Defaults to `127.0.0.1:0` when `--relay` is used. |
 | `--public-host <host>` | machine FQDN/IP | Hostname advertised in the banner and docs. |
 | `--token <token>` | `$WITNESS_TOKEN` or random | Bearer token for this session. |
 | `--max-commands <n>` | `10000` | Retained command records (ring buffer). |
 | `--max-output-bytes <n>` | `1048576` | Captured output cap per command; extra is truncated. |
 | `--auto-approve` | off | Run agent suggestions without waiting for Ctrl-G. |
 | `--audit-log <path>` | off, or the default path with `--auto-approve` | Append every command and suggestion to this file. |
+| `--relay <url>` | off | Connect the session host outbound to this relay URL. |
+| `--relay-key-file <path>` | `$WITNESS_RELAY_KEY`, otherwise generated | Read the relay key from this file. Takes precedence over the environment. |
+
+`witness ssh` accepts `--auto-approve`, `--audit-log`, `--relay`, and `--relay-key-file` before
+the SSH host. In a nested witness session, the outer `witness run` configuration applies and
+these flags are ignored.
+
+`witness connect <relay-url>` options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--addr <host:port>` | `127.0.0.1:0` | Local API bind address; port `0` picks a free port. |
+| `--token <token>` | `$WITNESS_TOKEN` or random | Bearer token checked by the local API. |
+| `--relay-key-file <path>` | `$WITNESS_RELAY_KEY`, otherwise prompt | Read the relay key from this file. Takes precedence over the environment. |
+
+`witness serve` accepts `--addr <host:port>` (default `0.0.0.0:8080`), and `witness key` prints a
+fresh relay key.
 
 The token is valid only for the running session; each session picks its own port. `witness
 token` prints a fresh random token.

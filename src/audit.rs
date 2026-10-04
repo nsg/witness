@@ -25,10 +25,12 @@ pub enum AuditEvent<'a> {
         suggestion_id: u64,
         command: &'a str,
         reason: Option<&'a str>,
+        via: &'static str,
     },
     SuggestionRejected {
         command: &'a str,
         error: &'a str,
+        via: &'static str,
     },
     /// The human pulled the suggestion into their prompt with Ctrl-G.
     Inserted {
@@ -153,17 +155,25 @@ mod tests {
             exit_code: Some(0),
         })
         .unwrap();
+        log.record(&AuditEvent::Suggested {
+            suggestion_id: 4,
+            command: "echo relay",
+            reason: None,
+            via: "relay",
+        })
+        .unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let entries: Vec<serde_json::Value> = contents
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0]["event"], "auto_approved");
         assert_eq!(entries[0]["command"], "echo \"hi\"");
         assert_eq!(entries[0]["suggestion_id"], 3);
         assert!(entries[0]["at"].is_string());
         assert_eq!(entries[1]["event"], "command_finished");
+        assert_eq!(entries[2]["via"], "relay");
     }
 }
