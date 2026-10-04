@@ -12,10 +12,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: ubuntu-latest
+          # A glibc binary only runs cleanly on the glibc it was linked
+          # against or newer, so each build is pinned to a runner release.
+          # install.sh maps glibc versions to these artifacts.
+          - runner: ubuntu-24.04
             artifact: witness-linux-glibc
-          # A glibc binary only runs on the glibc it was linked against or
-          # newer, so older distributions get a build from an older runner.
+            max_glibc: '2.39'
           - runner: ubuntu-22.04
             artifact: witness-linux-glibc2.35
             max_glibc: '2.35'
@@ -43,7 +45,6 @@ jobs:
         run: cargo build --release
 
       - name: Check required glibc version
-        if: matrix.max_glibc
         env:
           MAX_GLIBC: ${{ matrix.max_glibc }}
         run: |
