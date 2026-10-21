@@ -14,7 +14,7 @@ BASE_URL="https://github.com/nsg/witness/releases/latest/download"
 
 # Release builds as "minimum glibc:asset", newest glibc first. The first one
 # this system's glibc satisfies is used.
-BUILDS=(2.39:witness-linux-glibc 2.35:witness-linux-glibc2.35)
+BUILDS=(2.39:witness-linux-glibc 2.35:witness-linux-glibc2.35 2.31:witness-linux-glibc2.31)
 
 die() {
     echo "install.sh: $*" >&2

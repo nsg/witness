@@ -14,17 +14,33 @@ jobs:
         include:
           # A glibc binary only runs cleanly on the glibc it was linked
           # against or newer, so each build is pinned to a runner release.
-          # install.sh maps glibc versions to these artifacts.
+          # install.sh maps glibc versions to these artifacts. Releases that
+          # no longer have a runner image are built in a container instead.
           - runner: ubuntu-24.04
             artifact: witness-linux-glibc
             max_glibc: '2.39'
           - runner: ubuntu-22.04
             artifact: witness-linux-glibc2.35
             max_glibc: '2.35'
+          - runner: ubuntu-24.04
+            container: ubuntu:20.04
+            artifact: witness-linux-glibc2.31
+            max_glibc: '2.31'
     runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+
+      - name: Install build tools
+        if: matrix.container
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev binutils
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install Rust toolchain
         run: |
@@ -38,8 +54,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.runner }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ matrix.runner }}-cargo-release-
+          key: ${{ matrix.artifact }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.artifact }}-cargo-release-
 
       - name: Build release binary
         run: cargo build --release
@@ -106,4 +122,5 @@ jobs:
             git log --oneline -20
             echo '```'
           } | gh release create latest --title "Latest" --notes-file - \
-            dist/witness-linux-glibc dist/witness-linux-glibc2.35 dist/sha256sums.txt
+            dist/witness-linux-glibc dist/witness-linux-glibc2.35 \
+            dist/witness-linux-glibc2.31 dist/sha256sums.txt
