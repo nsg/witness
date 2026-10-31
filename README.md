@@ -59,6 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/nsg/witness/master/install.sh | bas
 The script picks the build that matches this system's glibc. Run it again to
 update: a `witness` already in `PATH` is replaced in place, otherwise it goes to
 `~/.local/bin` or `~/bin`. Set `WITNESS_INSTALL_DIR` to install somewhere else.
+Add `--service` to also [run witness as a service](#running-as-a-service).
 
 Start a session:
 
@@ -276,6 +277,48 @@ once more. Revoke closes an approved channel at once, including streams already 
 This is a check on who uses the relay, enforced by the relay. It stops an agent, or someone with
 a copied key, from connecting unnoticed. It is not part of the end-to-end protection: a
 compromised relay could skip it, though it still could not read or forge traffic.
+
+### Running as a service
+
+The install script can also set up a systemd service, so a host stays reachable through the relay
+without anyone starting a session on it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nsg/witness/master/install.sh | bash -s -- --service
+```
+
+| Run as | Service | Binary, if new | Default key file |
+|--------|---------|----------------|------------------|
+| root | System service, runs as root. | `/usr/local/bin` | `/root/.config/witness/relay.key` |
+| another user | User service, runs as that user. Lingering is enabled so it starts at boot. | `~/.local/bin` or `~/bin` | `~/.config/witness/relay.key` |
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--relay <url>` | `https://witness.k8s.junkpile.se` | Relay to connect to. |
+| `--key-file <path>` | see above | Relay key file. An existing file is used as it is; otherwise a new key is written there with mode `0600`. |
+
+Copy the key file securely to the agent host and connect with `--relay-key-file`.
+
+Some systems refuse to let a user enable lingering. The script then warns and prints the
+`loginctl enable-linger` command for an admin to run; until then a user service stops at logout
+and does not start at boot.
+
+> [!WARNING]
+> A service has no terminal, so nobody can press Ctrl-G and it runs with `--auto-approve`: anyone
+> holding the relay key can run commands as the service's user, which is root if you installed as
+> root. Require [approval on the relay](#approving-agents-on-the-relay) for a human check on top.
+
+The session wraps a login shell. Stopping or restarting the service ends the shell and everything
+started from it, and it comes back after 5 seconds if it exits on its own. Shell output is
+discarded; the journal holds only the startup banner and errors. That banner includes the session
+token, which is only usable from the local API.
+
+Running the script again with `--service` updates the binary and leaves an enabled service and its
+key alone, and does not restart it: run `systemctl restart witness.service` (`--user` for a user
+service) to move it to the new binary. A disabled service is enabled and started again, with its
+existing unit. To change the relay or key, run `systemctl disable --now witness.service` and delete
+the unit first. Do not reuse a key that a running session is connected with, as two sessions on one
+relay channel may break both.
 
 ## Configuration
 
