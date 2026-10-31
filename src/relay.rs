@@ -16,7 +16,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -81,7 +81,7 @@ struct Approvals {
 
 struct Approval {
     agent: String,
-    requested_at: String,
+    requested_at: DateTime<Utc>,
     seen: Instant,
     approved: bool,
 }
@@ -89,7 +89,7 @@ struct Approval {
 struct ApprovalRow {
     channel: [u8; 16],
     agent: String,
-    requested_at: String,
+    requested_at: DateTime<Utc>,
     approved_for: Option<Duration>,
 }
 
@@ -123,7 +123,7 @@ impl Approvals {
         self.prune(now);
         if let Some(entry) = self.entries.get_mut(&channel) {
             if entry.approved {
-                entry.requested_at = timestamp();
+                entry.requested_at = Utc::now();
             }
             entry.approved = false;
             entry.seen = now;
@@ -148,7 +148,7 @@ impl Approvals {
             channel,
             Approval {
                 agent: agent.to_owned(),
-                requested_at: timestamp(),
+                requested_at: Utc::now(),
                 seen: now,
                 approved: false,
             },
@@ -180,22 +180,16 @@ impl Approvals {
             .map(|(channel, entry)| ApprovalRow {
                 channel: *channel,
                 agent: entry.agent.clone(),
-                requested_at: entry.requested_at.clone(),
+                requested_at: entry.requested_at,
                 approved_for: entry
                     .approved
                     .then(|| self.idle.saturating_sub(now.duration_since(entry.seen))),
             })
             .collect();
-        rows.sort_by(|a, b| {
-            (a.approved_for.is_some(), &a.requested_at)
-                .cmp(&(b.approved_for.is_some(), &b.requested_at))
-        });
+        // The channel breaks ties, so a refresh never swaps two rows.
+        rows.sort_by_key(|row| (row.approved_for.is_some(), row.requested_at, row.channel));
         rows
     }
-}
-
-fn timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 /// Enforces the approval on one socket of a channel. Both sockets of a pair
@@ -300,67 +294,147 @@ pub fn router(approval_idle: Option<Duration>) -> Router {
 }
 
 async fn admin(State(state): State<RelayState>) -> Html<String> {
-    let rows = match state.inner.lock().unwrap().approvals.as_mut() {
-        Some(approvals) => approvals.rows(Instant::now()),
-        None => Vec::new(),
+    let (rows, idle) = match state.inner.lock().unwrap().approvals.as_mut() {
+        Some(approvals) => (approvals.rows(Instant::now()), approvals.idle),
+        None => (Vec::new(), Duration::ZERO),
     };
-    Html(render_admin(&rows, &state.csrf))
+    Html(render_admin(&rows, idle, Utc::now(), &state.csrf))
 }
 
-fn render_admin(rows: &[ApprovalRow], csrf: &str) -> String {
-    let mut page = String::from(concat!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
-        "<meta http-equiv=\"refresh\" content=\"5\">",
-        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
-        "<title>witness relay approvals</title><style>",
-        "body{font-family:system-ui,sans-serif;margin:2rem;color:#1a1a1a}",
-        "table{border-collapse:collapse}th,td{text-align:left;padding:.4rem .9rem;",
-        "border-bottom:1px solid #ddd}code{font-size:.9em}button{padding:.3rem .8rem}",
-        "form{display:inline}</style></head><body><h1>witness relay approvals</h1>",
-        "<p>The channel is the middle part of the relay key. ",
-        "Traffic is end-to-end encrypted, so nothing else about a request is visible here.</p>",
-    ));
+const ADMIN_HEAD: &str = concat!(
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+    "<noscript><meta http-equiv=\"refresh\" content=\"5\"></noscript>",
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">",
+    "<title>witness relay approvals</title><style>",
+    include_str!("admin.css"),
+    "</style></head><body><main class=\"page\"><header class=\"top\">",
+    "<h1>witness <span>relay</span></h1><p id=\"status\" class=\"status\">Live</p></header>",
+);
+const ADMIN_FOOT: &str = concat!(
+    "</main><script>",
+    include_str!("admin.js"),
+    "</script></body></html>",
+);
+
+fn render_admin(rows: &[ApprovalRow], idle: Duration, now: DateTime<Utc>, csrf: &str) -> String {
+    let (approved, waiting): (Vec<_>, Vec<_>) =
+        rows.iter().partition(|row| row.approved_for.is_some());
+    let mut page = String::from(ADMIN_HEAD);
+    page.push_str("<div id=\"approvals\">");
     if rows.is_empty() {
-        page.push_str("<p>No agent is waiting and nothing is approved.</p>");
-    } else {
         page.push_str(
-            "<table><tr><th>Channel</th><th>Agent address</th><th>Asked</th>\
-             <th>Status</th><th></th></tr>",
+            "<div class=\"empty\"><p>All quiet</p><p>No agent is waiting and nothing is \
+             approved. New requests appear here on their own.</p></div>",
         );
-        for row in rows {
-            let channel = channel_hex(&row.channel);
-            let button = |action: &str, label: &str| {
-                format!(
-                    "<form method=\"post\" action=\"admin/{action}/{channel}\">\
-                     <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
-                     <button>{label}</button></form> "
-                )
+    } else {
+        for (title, section, nothing) in [
+            ("Waiting", &waiting, "No agent is waiting."),
+            ("Approved", &approved, "Nothing is approved."),
+        ] {
+            let pending = if title == "Waiting" && !section.is_empty() {
+                " pending"
+            } else {
+                ""
             };
-            let (status, buttons) = match row.approved_for {
-                Some(left) => (
-                    format!(
-                        "approved, {} min of silence left",
-                        left.as_secs().div_ceil(60)
-                    ),
-                    button("revoke", "Revoke"),
-                ),
-                None => (
-                    "waiting for approval".to_owned(),
-                    button("approve", "Approve") + &button("revoke", "Dismiss"),
-                ),
-            };
+            let count = section.len();
             let _ = write!(
                 page,
-                "<tr><td><code>{channel}</code></td><td>{}</td><td>{}</td>\
-                 <td>{status}</td><td>{buttons}</td></tr>",
-                escape_html(&row.agent),
-                escape_html(&row.requested_at),
+                "<h2>{title} <span class=\"count{pending}\">{count}</span></h2>"
             );
+            if section.is_empty() {
+                let _ = write!(page, "<p class=\"none\">{nothing}</p>");
+                continue;
+            }
+            page.push_str("<ul class=\"list\">");
+            for row in section {
+                render_approval(&mut page, row, idle, now, csrf);
+            }
+            page.push_str("</ul>");
         }
-        page.push_str("</table>");
     }
-    page.push_str("</body></html>");
+    let _ = write!(
+        page,
+        "</div><footer>Approvals close after {} min of silence. The channel is the middle of \
+         the relay key: <code>wk1_<mark>channel</mark>_secret</code>. Traffic is end-to-end \
+         encrypted, so nothing else about a request is visible here.</footer>",
+        idle.as_secs().div_ceil(60),
+    );
+    page.push_str(ADMIN_FOOT);
     page
+}
+
+fn render_approval(
+    page: &mut String,
+    row: &ApprovalRow,
+    idle: Duration,
+    now: DateTime<Utc>,
+    csrf: &str,
+) {
+    let channel = channel_hex(&row.channel);
+    let button = |action: &str, class: &str, label: &str| {
+        format!(
+            "<form method=\"post\" action=\"admin/{action}/{channel}\">\
+             <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+             <button class=\"{class}\">{label}</button></form>"
+        )
+    };
+    let (class, activity, controls) = match row.approved_for {
+        Some(left) => {
+            let low = if left < idle / 8 { " low" } else { "" };
+            (
+                format!("approved{low}"),
+                format!("active {}", ago(idle.saturating_sub(left))),
+                format!(
+                    "<div class=\"time\"><div class=\"left\">{} min left</div>\
+                     <div class=\"bar\"><i style=\"width:{:.0}%\"></i></div></div>\
+                     <details class=\"revoke\"><summary><span class=\"ask\">Revoke</span>\
+                     <span class=\"keep\">Keep</span></summary><div class=\"confirm\">\
+                     <p>Close this channel? Open streams stop at once.</p>{}</div></details>",
+                    left.as_secs().div_ceil(60),
+                    left.div_duration_f64(idle) * 100.0,
+                    button("revoke", "", "Revoke now"),
+                ),
+            )
+        }
+        None => (
+            "waiting".to_owned(),
+            format!(
+                "asked {}",
+                ago((now - row.requested_at).to_std().unwrap_or_default())
+            ),
+            format!(
+                "<div class=\"actions\">{}{}</div>",
+                button("approve", "approve", "Approve"),
+                button("revoke", "", "Dismiss"),
+            ),
+        ),
+    };
+    let _ = write!(
+        page,
+        "<li class=\"row {class}\"><div class=\"who\"><code class=\"channel\">{}</code>\
+         <div class=\"meta\">{} · <span title=\"Asked {}\">{activity}</span></div></div>\
+         {controls}</li>",
+        grouped_channel(&row.channel),
+        escape_html(&row.agent),
+        row.requested_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+    );
+}
+
+/// Inline, so a channel copied from the page is still one unbroken string.
+fn grouped_channel(channel: &[u8; 16]) -> String {
+    channel
+        .chunks(2)
+        .map(|pair| format!("<span>{:02x}{:02x}</span>", pair[0], pair[1]))
+        .collect::<Vec<_>>()
+        .join("<wbr>")
+}
+
+fn ago(elapsed: Duration) -> String {
+    match elapsed.as_secs() / 60 {
+        0 => "just now".to_owned(),
+        minutes @ 1..120 => format!("{minutes} min ago"),
+        minutes => format!("{} h ago", minutes / 60),
+    }
 }
 
 fn escape_html(value: &str) -> String {
@@ -851,16 +925,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn admin_page_escapes_the_reported_agent_address() {
-        let rows = [ApprovalRow {
+    fn row(approved_for: Option<Duration>) -> ApprovalRow {
+        ApprovalRow {
             channel: CHANNEL,
             agent: "<script>alert(1)</script>".into(),
-            requested_at: "2026-10-04T09:00:00Z".into(),
-            approved_for: None,
-        }];
-        let page = render_admin(&rows, "token");
-        assert!(!page.contains("<script>"));
+            requested_at: DateTime::UNIX_EPOCH,
+            approved_for,
+        }
+    }
+
+    fn page(row: ApprovalRow, age: Duration) -> String {
+        render_admin(&[row], IDLE, DateTime::UNIX_EPOCH + age, "token")
+    }
+
+    #[test]
+    fn admin_page_escapes_the_reported_agent_address() {
+        let page = page(row(None), Duration::ZERO);
+        assert!(!page.contains("<script>alert"));
         assert!(page.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn admin_page_says_how_an_approval_is_ageing() {
+        let left = IDLE / 2;
+        let page = page(row(Some(left)), Duration::ZERO);
+        assert!(page.contains(&format!("{} min left", left.as_secs().div_ceil(60))));
+        assert!(page.contains(&format!("active {}", ago(IDLE - left))));
+        assert!(page.contains("width:50%"));
+    }
+
+    #[test]
+    fn admin_page_flags_an_approval_about_to_close() {
+        assert!(page(row(Some(IDLE / 16)), Duration::ZERO).contains("approved low"));
+        assert!(!page(row(Some(IDLE / 2)), Duration::ZERO).contains("approved low"));
+    }
+
+    #[test]
+    fn admin_page_shows_the_whole_channel_in_groups() {
+        let channel = channel_hex(&CHANNEL);
+        let groups = grouped_channel(&CHANNEL)
+            .replace("<wbr>", "")
+            .replace("<span>", "")
+            .replace("</span>", "");
+        assert_eq!(groups, channel);
+    }
+
+    #[test]
+    fn revoking_needs_a_second_step_but_dismissing_does_not() {
+        let revoke = page(row(Some(IDLE)), Duration::ZERO);
+        let form = revoke.find("action=\"admin/revoke/").unwrap();
+        assert!(revoke.find("<details").unwrap() < form);
+
+        let dismiss = page(row(None), Duration::ZERO);
+        assert!(!dismiss.contains("<details"));
+        assert!(dismiss.contains("action=\"admin/revoke/"));
+    }
+
+    #[test]
+    fn rows_with_the_same_timestamp_keep_their_order() {
+        let mut approvals = Approvals::new(IDLE);
+        let now = Instant::now();
+        let requested_at = Utc::now();
+        for channel in [[3; 16], [1; 16], [2; 16]] {
+            approvals.request(channel, "agent", now);
+            approvals.entries.get_mut(&channel).unwrap().requested_at = requested_at;
+        }
+        let order: Vec<_> = approvals
+            .rows(now)
+            .iter()
+            .map(|row| row.channel[0])
+            .collect();
+        assert_eq!(order, [1, 2, 3]);
+    }
+
+    #[test]
+    fn elapsed_time_reads_in_the_largest_useful_unit() {
+        assert_eq!(ago(Duration::from_secs(59)), "just now");
+        assert_eq!(ago(Duration::from_secs(60)), "1 min ago");
+        assert_eq!(ago(Duration::from_secs(119 * 60)), "119 min ago");
+        assert_eq!(ago(Duration::from_secs(120 * 60)), "2 h ago");
     }
 }
